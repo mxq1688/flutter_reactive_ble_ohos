@@ -1,0 +1,20 @@
+# Dart/Flutter
+.dart_tool/
+.packages
+build/
+pubspec.lock
+
+# HarmonyOS OHOS
+ohos/build/
+ohos/.cxx/
+ohos/oh-package-lock.json5
+ohos/oh_modules/
+ohos/libs/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# macOS
+.DS_Store

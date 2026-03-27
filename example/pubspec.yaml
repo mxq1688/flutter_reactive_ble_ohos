@@ -1,0 +1,17 @@
+name: flutter_reactive_ble_ohos_example
+description: Demonstrates how to use flutter_reactive_ble_ohos plugin.
+publish_to: 'none'
+version: 1.0.0
+
+environment:
+  sdk: ">=2.17.0 <4.0.0"
+  flutter: ">=2.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_reactive_ble_ohos:
+    path: ../
+
+flutter:
+  uses-material-design: true

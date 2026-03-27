@@ -1,0 +1,7 @@
+{
+  "module": {
+    "name": "flutter_reactive_ble_ohos",
+    "type": "har",
+    "deviceTypes": ["default", "tablet", "2in1"]
+  }
+}

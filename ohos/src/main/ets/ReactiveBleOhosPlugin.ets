@@ -1,0 +1,1040 @@
+/**
+ * reactive_ble_ohos - HarmonyOS NEXT BLE 插件
+ *
+ * 基于 @kit.ConnectivityKit (ble) 与 @ohos.bluetooth.access 实现。
+ * 参考文档：https://developer.huawei.com/consumer/cn/doc/harmonyos-references/js-apis-bluetooth-ble
+ *
+ * 实现除 clearGattCache 外的全部能力，与 Dart 层通过以下 Channel 通信：
+ * - MethodChannel: reactive_ble_ohos_method
+ * - EventChannel: reactive_ble_ohos_scan, reactive_ble_ohos_connected_device,
+ *   reactive_ble_ohos_char_update, reactive_ble_ohos_status
+ */
+
+import {
+  FlutterPlugin,
+  FlutterPluginBinding,
+  MethodChannel,
+  MethodCall,
+  MethodCallHandler,
+  MethodResult,
+  EventChannel,
+  EventSink,
+  StreamHandler,
+} from '@ohos/flutter_ohos';
+import { ble, constant } from '@kit.ConnectivityKit';
+import access from '@ohos.bluetooth.access';
+import { BusinessError } from '@kit.BasicServicesKit';
+
+const METHOD_CHANNEL = 'reactive_ble_ohos_method';
+const EVENT_SCAN = 'reactive_ble_ohos_scan';
+const EVENT_CONNECTION = 'reactive_ble_ohos_connected_device';
+const EVENT_CHAR_UPDATE = 'reactive_ble_ohos_char_update';
+const EVENT_BLE_STATUS = 'reactive_ble_ohos_status';
+
+const NO_OP_STREAM_HANDLER: StreamHandler = {
+  onListen(_args: object, _sink: EventSink): void {},
+  onCancel(_args: object): void {}
+};
+
+// Explicit interfaces for ArkTS (no untyped object literals)
+interface BleStatusPayload {
+  status: number;
+}
+interface ConnectionPayload {
+  deviceId: string;
+  connectionState: number;
+  failureMessage?: string;
+}
+interface ScanDevicePayload {
+  id: string;
+  name: string;
+  rssi: number;
+  serviceUuids: string[];
+  serviceData: Record<string, number[]>;
+  manufacturerData: number[];
+  connectable: number;
+}
+interface ScanResultPayload {
+  device?: ScanDevicePayload;
+  error?: string;
+}
+interface CharUpdatePayload {
+  characteristic: CharRef;
+  value?: number[];
+  error?: string;
+}
+interface WriteResultPayload {
+  characteristic: CharRef;
+  error?: string;
+}
+interface MtuResultPayload {
+  mtu: number;
+}
+interface RssiResultPayload {
+  rssi: number;
+}
+interface ConnStateWithCode {
+  code?: number;
+}
+interface GattWithPriority {
+  requestConnectionPriority(priority: number): void;
+}
+interface CharRef {
+  deviceId: string;
+  serviceId: string;
+  serviceInstanceId: string;
+  characteristicId: string;
+  characteristicInstanceId: string;
+}
+interface BLECharWrite {
+  characteristicValue: ArrayBuffer;
+}
+interface DiscoveredChar {
+  characteristicId: string;
+  characteristicInstanceId: string;
+  isReadable: boolean;
+  isWritableWithResponse: boolean;
+  isWritableWithoutResponse: boolean;
+  isNotifiable: boolean;
+  isIndicatable: boolean;
+}
+interface DiscoveredService {
+  serviceId: string;
+  serviceInstanceId: string;
+  characteristics: DiscoveredChar[];
+  includedServices: DiscoveredService[];
+}
+
+// BLE status codes (与 Dart BleStatus 枚举一致)
+const BLE_STATUS_UNKNOWN = 0;
+const BLE_STATUS_UNSUPPORTED = 1;
+const BLE_STATUS_UNAUTHORIZED = 2;
+const BLE_STATUS_POWERED_OFF = 3;
+const BLE_STATUS_LOCATION_DISABLED = 4;
+const BLE_STATUS_READY = 5;
+
+// Connection state codes (与 Dart DeviceConnectionState 一致)
+const CONN_STATE_CONNECTING = 0;
+const CONN_STATE_CONNECTED = 1;
+const CONN_STATE_DISCONNECTING = 2;
+const CONN_STATE_DISCONNECTED = 3;
+
+// Connectable (与 Dart Connectable 一致)
+const CONNECTABLE_UNKNOWN = 0;
+const CONNECTABLE_UNAVAILABLE = 1;
+const CONNECTABLE_AVAILABLE = 2;
+
+export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallHandler {
+  getUniqueClassName(): string {
+    return 'ReactiveBleOhosPlugin';
+  }
+
+  private methodChannel: MethodChannel | null = null;
+  private scanChannel: EventChannel | null = null;
+  private connectionChannel: EventChannel | null = null;
+  private charUpdateChannel: EventChannel | null = null;
+  private bleStatusChannel: EventChannel | null = null;
+
+  private scanSink: EventSink | null = null;
+  private connectionSink: EventSink | null = null;
+  private charUpdateSink: EventSink | null = null;
+  private bleStatusSink: EventSink | null = null;
+
+  private binding: FlutterPluginBinding | null = null;
+
+  /** 已连接的 GATT 客户端设备，key 为 deviceId */
+  private connectedDevices: Map<string, ble.GattClientDevice> = new Map();
+  /** 已注册的 BLECharacteristicChange 回调，key 为 deviceId，用于 stopNotifications 时移除 */
+  private charChangeCallbacks: Map<string, (ch: ble.BLECharacteristic) => void> = new Map();
+  /** 正在连接的设备，用于连接超时与状态回调 */
+  private connectingDeviceId: string | null = null;
+  private connectingClient: ble.GattClientDevice | null = null;
+  /** 连接超时定时器 ID，用于在连接成功/失败时清除 */
+  private connectTimeoutId: number = -1;
+
+  // GattClient 创建优化：防止批量创建导致系统崩溃
+  private isScanning: boolean = false;
+  private pendingNameRequests: Set<string> = new Set(); // 正在获取名称的设备
+  private completedNameRequests: Set<string> = new Set(); // 已完成名称获取的设备
+  private activeGattClients: Map<string, ble.GattClientDevice> = new Map(); // 活跃的临时 GattClient
+  private static readonly MAX_CONCURRENT_NAME_REQUESTS = 3; // 最大并发数
+  private nameRequestQueue: Array<string> = []; // 等待队列
+  private discoveredDeviceIds: Set<string> = new Set(); // 已发现的设备 ID（用于去重）
+
+  onAttachedToEngine(binding: FlutterPluginBinding): void {
+    this.binding = binding;
+    this.methodChannel = new MethodChannel(binding.getBinaryMessenger(), METHOD_CHANNEL);
+    this.methodChannel.setMethodCallHandler(this);
+
+    this.scanChannel = new EventChannel(binding.getBinaryMessenger(), EVENT_SCAN);
+    this.scanChannel.setStreamHandler(this.createStreamHandler(
+      (sink: EventSink) => { this.scanSink = sink; },
+      () => { this.scanSink = null; }
+    ));
+
+    this.connectionChannel = new EventChannel(binding.getBinaryMessenger(), EVENT_CONNECTION);
+    this.connectionChannel.setStreamHandler(this.createStreamHandler(
+      (sink: EventSink) => { this.connectionSink = sink; },
+      () => { this.connectionSink = null; }
+    ));
+
+    this.charUpdateChannel = new EventChannel(binding.getBinaryMessenger(), EVENT_CHAR_UPDATE);
+    this.charUpdateChannel.setStreamHandler(this.createStreamHandler(
+      (sink: EventSink) => { this.charUpdateSink = sink; },
+      () => { this.charUpdateSink = null; }
+    ));
+
+    this.bleStatusChannel = new EventChannel(binding.getBinaryMessenger(), EVENT_BLE_STATUS);
+    this.bleStatusChannel.setStreamHandler(this.createStreamHandler(
+      (sink: EventSink) => {
+        this.bleStatusSink = sink;
+        this.emitBleStatus();
+      },
+      () => { this.bleStatusSink = null; }
+    ));
+
+    // 监听蓝牙适配器状态变化（参考 js-apis-bluetooth-ble 与 bluetooth.access）
+    try {
+      access.on('stateChange', (state: number) => {
+        this.emitBleStatus();
+      });
+    } catch (e) {
+    }
+  }
+
+  onDetachedFromEngine(_binding: FlutterPluginBinding): void {
+    try {
+      access.off('stateChange');
+      ble.off('BLEDeviceFind');
+    } catch (e) {
+    }
+    this.stopScan();
+    this.disconnectAll();
+    this.scanChannel?.setStreamHandler(NO_OP_STREAM_HANDLER);
+    this.connectionChannel?.setStreamHandler(NO_OP_STREAM_HANDLER);
+    this.charUpdateChannel?.setStreamHandler(NO_OP_STREAM_HANDLER);
+    this.bleStatusChannel?.setStreamHandler(NO_OP_STREAM_HANDLER);
+    this.methodChannel?.setMethodCallHandler(null);
+    this.scanSink = null;
+    this.connectionSink = null;
+    this.charUpdateSink = null;
+    this.bleStatusSink = null;
+    this.methodChannel = null;
+    this.scanChannel = null;
+    this.connectionChannel = null;
+    this.charUpdateChannel = null;
+    this.bleStatusChannel = null;
+    this.binding = null;
+  }
+
+  private createStreamHandler(onListen: (sink: EventSink) => void, onCancel: () => void): StreamHandler {
+    const h: StreamHandler = {
+      onListen(_args: object, sink: EventSink): void {
+        onListen(sink);
+      },
+      onCancel(_args: object): void {
+        onCancel();
+      }
+    };
+    return h;
+  }
+
+  private getArgs(call: MethodCall): Record<string, Object> {
+    const keys: string[] = ['withServices', 'scanMode', 'requireLocationServicesEnabled', 'deviceId', 'timeoutInMs',
+      'serviceId', 'characteristicId', 'serviceInstanceId', 'characteristicInstanceId', 'value', 'mtuSize', 'priority'];
+    const out: Record<string, Object> = {};
+    for (let i = 0; i < keys.length; i++) {
+      const k: string = keys[i];
+      const v: Object | undefined = call.argument(k) as Object | undefined;
+      if (v !== undefined && v !== null) {
+        out[k] = v;
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 根据蓝牙适配器状态映射为 Dart BleStatus。
+   * access.getState() 返回值：STATE_OFF(0), STATE_ON(1), STATE_TURNING_ON(2), STATE_TURNING_OFF(3), STATE_BLE_TURNING_ON(4), STATE_BLE_TURNING_OFF(5), STATE_BLE_ON(6)
+   */
+  private mapAccessStateToBleStatus(state: number): number {
+    if (state === access.BluetoothState.STATE_ON || state === access.BluetoothState.STATE_BLE_ON) {
+      return BLE_STATUS_READY;
+    }
+    if (state === access.BluetoothState.STATE_OFF || state === access.BluetoothState.STATE_BLE_TURNING_OFF ||
+      state === access.BluetoothState.STATE_TURNING_OFF) {
+      return BLE_STATUS_POWERED_OFF;
+    }
+    return BLE_STATUS_UNKNOWN;
+  }
+
+  private emitBleStatus(): void {
+    try {
+      const state = access.getState();
+      const status = this.mapAccessStateToBleStatus(state);
+      const payload: BleStatusPayload = { status };
+      this.bleStatusSink?.success(payload);
+    } catch (e) {
+      const payload: BleStatusPayload = { status: BLE_STATUS_UNKNOWN };
+      this.bleStatusSink?.success(payload);
+    }
+  }
+
+  private emitConnectionUpdate(deviceId: string, connectionState: number, failureMessage?: string): void {
+    const payload: ConnectionPayload = {
+      deviceId,
+      connectionState,
+    };
+    if (failureMessage !== undefined && failureMessage.length > 0) {
+      payload.failureMessage = failureMessage;
+    }
+    try {
+      this.connectionSink?.success(payload);
+    } catch (e) {
+    }
+  }
+
+  private emitScanResult(device: ScanDevicePayload | null, error?: string): void {
+    if (error !== undefined) {
+      const payload: ScanResultPayload = { error };
+      this.scanSink?.success(payload);
+    } else if (device !== null) {
+      const payload: ScanResultPayload = { device };
+      this.scanSink?.success(payload);
+    }
+  }
+
+  private emitCharValue(characteristic: CharRef, value?: number[], error?: string): void {
+    const payload: CharUpdatePayload = { characteristic };
+    if (error !== undefined) payload.error = error;
+    if (value !== undefined) payload.value = value;
+    try {
+      this.charUpdateSink?.success(payload);
+    } catch (e) {
+    }
+  }
+
+  /**
+   * 将 Dart scanMode 映射为鸿蒙 ble.ScanDuty。
+   * Dart: -1 opportunistic, 0 lowPower, 1 balanced, 2 lowLatency
+   * 鸿蒙 ScanDuty: SCAN_MODE_LOW_POWER(0), SCAN_MODE_BALANCED(1), SCAN_MODE_LOW_LATENCY(2) 等
+   */
+  private mapScanModeToDuty(scanMode: number): number {
+    if (scanMode === 2) return 2; // lowLatency -> SCAN_MODE_LOW_LATENCY
+    if (scanMode === 1) return 1; // balanced -> SCAN_MODE_BALANCED
+    return 0; // 0 或 -1 -> SCAN_MODE_LOW_POWER
+  }
+
+  private stopScan(): void {
+    try {
+      ble.stopBLEScan();
+      ble.off('BLEDeviceFind');
+    } catch (e) {
+    }
+    this.isScanning = false;
+    this.cleanupPendingNameRequests();
+  }
+
+  private cleanupPendingNameRequests(): void {
+    // 关闭所有活跃的临时 GattClient
+    this.activeGattClients.forEach((client: ble.GattClientDevice, deviceId: string) => {
+      try {
+        client.close();
+      } catch (_) {}
+    });
+    this.activeGattClients.clear();
+    this.pendingNameRequests.clear();
+    this.completedNameRequests.clear();
+    this.nameRequestQueue = [];
+    this.discoveredDeviceIds.clear();
+  }
+
+  private processNameRequestQueue(): void {
+    while (
+      this.nameRequestQueue.length > 0 &&
+      this.pendingNameRequests.size < ReactiveBleOhosPlugin.MAX_CONCURRENT_NAME_REQUESTS &&
+      this.isScanning
+    ) {
+      const deviceId = this.nameRequestQueue.shift();
+      if (!deviceId) break;
+      if (this.pendingNameRequests.has(deviceId) || this.completedNameRequests.has(deviceId)) {
+        continue;
+      }
+      this.executeNameRequest(deviceId);
+    }
+  }
+
+  private executeNameRequest(deviceId: string): void {
+    if (!this.isScanning) return;
+
+    this.pendingNameRequests.add(deviceId);
+    let tempClient: ble.GattClientDevice;
+    try {
+      tempClient = ble.createGattClientDevice(deviceId);
+    } catch (e) {
+      this.pendingNameRequests.delete(deviceId);
+      this.processNameRequestQueue();
+      return;
+    }
+    this.activeGattClients.set(deviceId, tempClient);
+
+    const timeoutId = setTimeout(() => {
+      this.finalizeNameRequest(deviceId, tempClient, null);
+    }, 3000) as number;
+
+    tempClient.getDeviceName().then((resolvedName: string) => {
+      clearTimeout(timeoutId);
+      this.finalizeNameRequest(deviceId, tempClient, resolvedName);
+    }).catch((e: Error) => {
+      clearTimeout(timeoutId);
+      this.finalizeNameRequest(deviceId, tempClient, null);
+    });
+  }
+
+  private finalizeNameRequest(deviceId: string, client: ble.GattClientDevice, name: string | null): void {
+    try { client.close(); } catch (_) {}
+    this.activeGattClients.delete(deviceId);
+    this.pendingNameRequests.delete(deviceId);
+    this.completedNameRequests.add(deviceId);
+
+    if (name && name.length > 0 && this.isScanning) {
+      const updated: ScanDevicePayload = {
+        id: deviceId,
+        name,
+        rssi: 0,
+        serviceUuids: [],
+        serviceData: {},
+        manufacturerData: [],
+        connectable: CONNECTABLE_UNKNOWN,
+      };
+      this.emitScanResult(updated);
+    }
+    this.processNameRequestQueue();
+  }
+
+  private disconnectAll(): void {
+    this.charChangeCallbacks.clear();
+    this.connectedDevices.forEach((gatt, deviceId) => {
+      try {
+        gatt.disconnect();
+        gatt.close();
+      } catch (e) {
+      }
+    });
+    this.connectedDevices.clear();
+    if (this.connectingClient != null && this.connectingDeviceId != null) {
+      try {
+        this.connectingClient.close();
+      } catch (e) {
+      }
+      this.connectingClient = null;
+      this.connectingDeviceId = null;
+    }
+  }
+
+  /**
+   * 将 BLE 广播数据转为 ArrayBuffer。OHOS ScanResult.data 可能为 Uint8Array 等，DataView 仅接受 ArrayBuffer。
+   */
+  private toArrayBufferForAdv(raw: object): ArrayBuffer | null {
+    if (raw == null) return null;
+    if (raw instanceof ArrayBuffer) return raw;
+    if (raw instanceof Uint8Array) {
+      const copy = new ArrayBuffer(raw.length);
+      const view = new Uint8Array(copy);
+      for (let i = 0; i < raw.length; i++) {
+        view[i] = raw[i];
+      }
+      return copy;
+    }
+    return null;
+  }
+
+  /**
+   * 从广播数据中解析 16/128 位服务 UUID 列表。
+   * BLE AD 格式：byte0=len(含 type 与 data), byte1=type, byte2..=data，故 data 长度为 len-1。
+   */
+  private parseServiceUuidsFromAdvData(data: ArrayBuffer): string[] {
+    const uuids: string[] = [];
+    const view = new DataView(data);
+    let offset = 0;
+    while (offset < view.byteLength) {
+      const len = view.getUint8(offset);
+      if (len === 0 || offset + 1 + len > view.byteLength) break;
+      const type = view.getUint8(offset + 1);
+      const dataLen = len - 1;
+      if ((type === 0x02 || type === 0x03) && dataLen >= 2) {
+        for (let i = 0; i + 2 <= dataLen; i += 2) {
+          const u = view.getUint16(offset + 2 + i, true);
+          uuids.push('0000' + u.toString(16).padStart(4, '0') + '-0000-1000-8000-00805f9b34fb');
+        }
+      }
+      if ((type === 0x06 || type === 0x07) && dataLen >= 16) {
+        for (let i = 0; i + 16 <= dataLen; i += 16) {
+          let s = '';
+          for (let j = 0; j < 16; j++) {
+            s += view.getUint8(offset + 2 + i + j).toString(16).padStart(2, '0');
+          }
+          uuids.push(s.replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, '$1-$2-$3-$4-$5'));
+        }
+      }
+      offset += 1 + len;
+    }
+    return uuids;
+  }
+
+  /** 从广播数据中解析厂商数据（仅 AD type 0xFF 的 payload，与 Dart readExtendInfo 一致） */
+  private parseManufacturerData(data: ArrayBuffer): number[] {
+    const arr: number[] = [];
+    const view = new DataView(data);
+    let offset = 0;
+    while (offset < view.byteLength) {
+      const len = view.getUint8(offset);
+      if (len === 0 || offset + 1 + len > view.byteLength) break;
+      const type = view.getUint8(offset + 1);
+      if (type === 0xFF) {
+        for (let i = 0; i < len - 1; i++) {
+          arr.push(view.getUint8(offset + 2 + i));
+        }
+        break;
+      }
+      offset += 1 + len;
+    }
+    return arr;
+  }
+
+  /** 从广播数据中解析本地名称，优先 Complete Local Name (0x09)，其次 Short Name (0x08) */
+  private parseLocalNameFromAdvData(data: ArrayBuffer): string {
+    const view = new DataView(data);
+    let shortName = '';
+    let offset = 0;
+    while (offset < view.byteLength) {
+      const len = view.getUint8(offset);
+      if (len === 0 || offset + 1 + len > view.byteLength) break;
+      const type = view.getUint8(offset + 1);
+      const dataLen = len - 1;
+      if (type === 0x09) {
+        let s = '';
+        for (let i = 0; i < dataLen; i++) {
+          s += String.fromCharCode(view.getUint8(offset + 2 + i));
+        }
+        return s;
+      }
+      if (type === 0x08 && shortName.length === 0) {
+        for (let i = 0; i < dataLen; i++) {
+          shortName += String.fromCharCode(view.getUint8(offset + 2 + i));
+        }
+      }
+      offset += 1 + len;
+    }
+    return shortName;
+  }
+
+  async onMethodCall(call: MethodCall, result: MethodResult): Promise<void> {
+    const method = call.method;
+    const args = this.getArgs(call);
+
+    try {
+      switch (method) {
+        case 'initialize':
+          this.emitBleStatus();
+          result.success(null);
+          break;
+
+        case 'deinitialize':
+          this.stopScan();
+          this.disconnectAll();
+          result.success(null);
+          break;
+
+        case 'scanForDevices': {
+          const withServices = args['withServices'] as string[] | undefined ?? [];
+          const scanMode = (args['scanMode'] as number) ?? 1;
+          const requireLocationServicesEnabled = (args['requireLocationServicesEnabled'] as boolean) ?? false;
+
+          this.stopScan();
+          // 重置名称请求状态
+          this.pendingNameRequests.clear();
+          this.nameRequestQueue = [];
+          this.completedNameRequests.clear();
+          this.discoveredDeviceIds.clear();
+
+          const filterArray: ble.ScanFilter[] = [];
+          for (let i = 0; i < withServices.length; i++) {
+            const filter: ble.ScanFilter = { serviceUuid: withServices[i] as string };
+            filterArray.push(filter);
+          }
+          const scanOption: ble.ScanOptions = {
+            dutyMode: this.mapScanModeToDuty(scanMode) as ble.ScanDuty,
+            matchMode: ble.MatchMode.MATCH_MODE_AGGRESSIVE,
+            interval: 0,
+          };
+          ble.on('BLEDeviceFind', (data: Array<ble.ScanResult>) => {
+            if (data.length === 0) return;
+            const item = data[0];
+
+            let name = '';
+            let serviceUuids: string[] = [];
+            let manufacturerData: number[] = [];
+            try {
+              const arrayBuf = this.toArrayBufferForAdv(item.data as object);
+              if (arrayBuf != null && arrayBuf.byteLength > 0) {
+                serviceUuids = this.parseServiceUuidsFromAdvData(arrayBuf);
+                manufacturerData = this.parseManufacturerData(arrayBuf);
+                const advName = this.parseLocalNameFromAdvData(arrayBuf);
+                if (advName.length > 0) name = advName;
+              }
+            } catch (parseErr) {
+            }
+            const connectable = item.connectable === true ? CONNECTABLE_AVAILABLE :
+              (item.connectable === false ? CONNECTABLE_UNAVAILABLE : CONNECTABLE_UNKNOWN);
+            const device: ScanDevicePayload = {
+              id: item.deviceId,
+              name,
+              rssi: item.rssi ?? 0,
+              serviceUuids,
+              serviceData: {},
+              manufacturerData,
+              connectable,
+            };
+            this.emitScanResult(device);
+
+            // 对名称请求去重（避免为同一设备重复创建 GattClient），但不拦截扫描上报
+            if (name.length === 0 && !this.discoveredDeviceIds.has(item.deviceId)) {
+              this.discoveredDeviceIds.add(item.deviceId);
+              if (!this.pendingNameRequests.has(item.deviceId) &&
+                  !this.completedNameRequests.has(item.deviceId) &&
+                  !this.nameRequestQueue.includes(item.deviceId)) {
+                this.nameRequestQueue.push(item.deviceId);
+                this.processNameRequestQueue();
+              }
+            }
+          });
+          if (filterArray.length === 0) {
+            ble.startBLEScan(null, scanOption);
+          } else {
+            ble.startBLEScan(filterArray, scanOption);
+          }
+          this.isScanning = true;
+          result.success(null);
+          break;
+        }
+
+        case 'connectToDevice': {
+          const deviceId = args['deviceId'] as string | undefined ?? '';
+          const timeoutInMs = (args['timeoutInMs'] as number) ?? 0;
+
+          if (this.connectedDevices.has(deviceId)) {
+            this.emitConnectionUpdate(deviceId, CONN_STATE_CONNECTED);
+            result.success(null);
+            break;
+          }
+          if (this.connectingDeviceId === deviceId) {
+            result.success(null);
+            break;
+          }
+          this.emitConnectionUpdate(deviceId, CONN_STATE_CONNECTING);
+          try {
+            const client = ble.createGattClientDevice(deviceId);
+            this.connectingDeviceId = deviceId;
+            this.connectingClient = client;
+
+            const onStateChange = (state: ble.BLEConnectionChangeState) => {
+              if (state.deviceId !== deviceId) return;
+              if (this.connectTimeoutId >= 0) {
+                clearTimeout(this.connectTimeoutId);
+                this.connectTimeoutId = -1;
+              }
+              if (state.state === constant.ProfileConnectionState.STATE_CONNECTED) {
+                this.connectingDeviceId = null;
+                this.connectingClient = null;
+                this.connectedDevices.set(deviceId, client);
+                // 先完成 GATT 服务发现再上报连接成功，避免写特征时 characteristic not found
+                client.getServices().then((_services: ble.GattService[]) => {
+                  // 短暂延迟再上报，缓解底层 descriptor 转换(memcpy_s)未完成导致特征未就绪
+                  setTimeout(() => {
+                    this.emitConnectionUpdate(deviceId, CONN_STATE_CONNECTED);
+                  }, 200);
+                }).catch((_err: object) => {
+                  this.connectedDevices.delete(deviceId);
+                  this.emitConnectionUpdate(deviceId, CONN_STATE_DISCONNECTED, 'Service discovery failed');
+                });
+              } else if (state.state === constant.ProfileConnectionState.STATE_DISCONNECTED) {
+                this.connectedDevices.delete(deviceId);
+                this.connectingDeviceId = null;
+                this.connectingClient = null;
+                try { client.close(); } catch (e) { }
+                const stateWithCode = state as ConnStateWithCode;
+                const msg = stateWithCode.code !== undefined ? `code: ${stateWithCode.code}` : 'disconnected';
+                this.emitConnectionUpdate(deviceId, CONN_STATE_DISCONNECTED, msg);
+              }
+            };
+            client.on('BLEConnectionStateChange', onStateChange);
+            client.connect();
+
+            if (timeoutInMs > 0) {
+              const timeoutId = setTimeout(() => {
+                this.connectTimeoutId = -1;
+                if (this.connectingDeviceId === deviceId && this.connectingClient != null) {
+                  try {
+                    this.connectingClient.close();
+                  } catch (e) { }
+                  this.connectingClient = null;
+                  this.connectingDeviceId = null;
+                  this.emitConnectionUpdate(deviceId, CONN_STATE_DISCONNECTED, 'Connection timeout');
+                }
+              }, timeoutInMs);
+              this.connectTimeoutId = timeoutId as number;
+            }
+          } catch (e) {
+            if (this.connectTimeoutId >= 0) {
+              clearTimeout(this.connectTimeoutId);
+              this.connectTimeoutId = -1;
+            }
+            const msg = (e as BusinessError).message ?? String(e);
+            this.emitConnectionUpdate(deviceId, CONN_STATE_DISCONNECTED, msg);
+            this.connectingDeviceId = null;
+            this.connectingClient = null;
+          }
+          result.success(null);
+          break;
+        }
+
+        case 'disconnectFromDevice': {
+          const deviceId = args['deviceId'] as string | undefined ?? '';
+          if (this.connectTimeoutId >= 0 && this.connectingDeviceId === deviceId) {
+            clearTimeout(this.connectTimeoutId);
+            this.connectTimeoutId = -1;
+          }
+          this.charChangeCallbacks.delete(deviceId);
+          const gatt = this.connectedDevices.get(deviceId);
+          if (gatt != null) {
+            try {
+              gatt.disconnect();
+              gatt.close();
+            } catch (e) {
+            }
+            this.connectedDevices.delete(deviceId);
+          }
+          if (this.connectingDeviceId === deviceId && this.connectingClient != null) {
+            try {
+              this.connectingClient.close();
+            } catch (e) {
+            }
+            this.connectingClient = null;
+            this.connectingDeviceId = null;
+          }
+          this.emitConnectionUpdate(deviceId, CONN_STATE_DISCONNECTED);
+          result.success(null);
+          break;
+        }
+
+        case 'discoverServices': {
+          const deviceId = args['deviceId'] as string | undefined ?? '';
+          const gatt = this.connectedDevices.get(deviceId);
+          if (gatt == null) {
+            result.error('discoverServices', 'device not connected', null);
+            break;
+          }
+          try {
+            const services = await gatt.getServices();
+            const list = this.buildDiscoveredServicesList(deviceId, services);
+            result.success(list);
+          } catch (e) {
+            const msg = (e as BusinessError).message ?? String(e);
+            result.error('discoverServices', msg, null);
+          }
+          break;
+        }
+
+        case 'readCharacteristic': {
+          const deviceId = args['deviceId'] as string | undefined ?? '';
+          const serviceId = args['serviceId'] as string | undefined ?? '';
+          const characteristicId = args['characteristicId'] as string | undefined ?? '';
+          const serviceInstanceId = args['serviceInstanceId'] as string | undefined ?? '';
+          const characteristicInstanceId = args['characteristicInstanceId']?.toString() ?? '';
+          const characteristic: CharRef = {
+            deviceId,
+            serviceId,
+            serviceInstanceId,
+            characteristicId,
+            characteristicInstanceId,
+          };
+          const gatt = this.connectedDevices.get(deviceId);
+          if (gatt == null) {
+            this.emitCharValue(characteristic, undefined, 'device not connected');
+            result.success(null);
+            break;
+          }
+          try {
+            const services = await gatt.getServices();
+            const charFound = this.findCharacteristic(services, serviceId, characteristicId);
+            if (charFound == null) {
+              this.emitCharValue(characteristic, undefined, 'characteristic not found');
+              result.success(null);
+              break;
+            }
+            const readChar = await gatt.readCharacteristicValue(charFound);
+            const value = readChar.characteristicValue != null ? Array.from(new Uint8Array(readChar.characteristicValue)) : [];
+            this.emitCharValue(characteristic, value);
+          } catch (e) {
+            this.emitCharValue(characteristic, undefined, (e as BusinessError).message ?? String(e));
+          }
+          result.success(null);
+          break;
+        }
+
+        case 'writeCharacteristicWithResponse':
+        case 'writeCharacteristicWithoutResponse': {
+          const deviceId = args['deviceId'] as string | undefined ?? '';
+          const serviceId = args['serviceId'] as string | undefined ?? '';
+          const characteristicId = args['characteristicId'] as string | undefined ?? '';
+          const serviceInstanceId = args['serviceInstanceId'] as string | undefined ?? '';
+          const characteristicInstanceId = args['characteristicInstanceId']?.toString() ?? '';
+          const value = (args['value'] as number[] | undefined) ?? [];
+          const characteristic: CharRef = {
+            deviceId,
+            serviceId,
+            serviceInstanceId,
+            characteristicId,
+            characteristicInstanceId,
+          };
+          const gatt = this.connectedDevices.get(deviceId);
+          if (gatt == null) {
+            const errPayload: WriteResultPayload = { characteristic, error: 'device not connected' };
+            result.success(errPayload);
+            break;
+          }
+          try {
+            const services = await gatt.getServices();
+            const charFound = this.findCharacteristic(services, serviceId, characteristicId);
+            if (charFound == null) {
+              const errPayload2: WriteResultPayload = { characteristic, error: 'characteristic not found' };
+              result.success(errPayload2);
+              break;
+            }
+            const writeType = method === 'writeCharacteristicWithResponse' ? ble.GattWriteType.WRITE : ble.GattWriteType.WRITE_NO_RESPONSE;
+            const buf = new ArrayBuffer(value.length);
+            const view = new DataView(buf);
+            for (let i = 0; i < value.length; i++) view.setUint8(i, value[i]);
+            const charForWrite: BLECharWrite = charFound as BLECharWrite;
+            charForWrite.characteristicValue = buf;
+            await gatt.writeCharacteristicValue(charFound, writeType);
+            const successPayload: WriteResultPayload = { characteristic };
+            result.success(successPayload);
+          } catch (e) {
+            const errPayload: WriteResultPayload = { characteristic, error: (e as BusinessError).message ?? String(e) };
+            result.success(errPayload);
+          }
+          break;
+        }
+
+        case 'readNotifications': {
+          const deviceId = args['deviceId'] as string | undefined ?? '';
+          const serviceId = args['serviceId'] as string | undefined ?? '';
+          const characteristicId = args['characteristicId'] as string | undefined ?? '';
+          const serviceInstanceId = args['serviceInstanceId'] as string | undefined ?? '';
+          const characteristicInstanceId = args['characteristicInstanceId']?.toString() ?? '';
+          const gatt = this.connectedDevices.get(deviceId);
+          if (gatt == null) {
+            result.success(null);
+            break;
+          }
+          try {
+            const services = await gatt.getServices();
+            const charFound = this.findCharacteristic(services, serviceId, characteristicId);
+            if (charFound != null) {
+              if (charFound.properties?.notify === true) {
+                await gatt.setCharacteristicChangeNotification(charFound, true);
+              } else if (charFound.properties?.indicate === true) {
+                await gatt.setCharacteristicChangeIndication(charFound, true);
+              }
+              if (!this.charChangeCallbacks.has(deviceId)) {
+                const callback = (ch: ble.BLECharacteristic): void => {
+                  const c: CharRef = {
+                    deviceId,
+                    serviceId: this.uuidStr(ch.serviceUuid),
+                    serviceInstanceId,
+                    characteristicId: this.uuidStr(ch.characteristicUuid),
+                    characteristicInstanceId,
+                  };
+                  const val = ch.characteristicValue != null ? Array.from(new Uint8Array(ch.characteristicValue as ArrayBuffer)) : [];
+                  this.emitCharValue(c, val);
+                };
+                gatt.on('BLECharacteristicChange', callback);
+                this.charChangeCallbacks.set(deviceId, callback);
+              }
+            }
+          } catch (e) {
+          }
+          result.success(null);
+          break;
+        }
+
+        case 'stopNotifications': {
+          const deviceId = args['deviceId'] as string | undefined ?? '';
+          const serviceId = args['serviceId'] as string | undefined ?? '';
+          const characteristicId = args['characteristicId'] as string | undefined ?? '';
+          const gatt = this.connectedDevices.get(deviceId);
+          if (gatt != null) {
+            try {
+              const services = await gatt.getServices();
+              const charFound = this.findCharacteristic(services, serviceId, characteristicId);
+              if (charFound != null) {
+                if (charFound.properties?.notify === true) {
+                  await gatt.setCharacteristicChangeNotification(charFound, false);
+                }
+                if (charFound.properties?.indicate === true) {
+                  await gatt.setCharacteristicChangeIndication(charFound, false);
+                }
+              }
+            } catch (e) {
+            }
+            const existingCallback = this.charChangeCallbacks.get(deviceId);
+            if (existingCallback) {
+              try {
+                gatt.off('BLECharacteristicChange', existingCallback);
+              } catch (e) {
+              }
+              this.charChangeCallbacks.delete(deviceId);
+            }
+          }
+          result.success(null);
+          break;
+        }
+
+        case 'negotiateMtuSize': {
+          const deviceId = args['deviceId'] as string | undefined ?? '';
+          const mtuSize = (args['mtuSize'] as number) ?? 512;
+          const gatt = this.connectedDevices.get(deviceId);
+          if (gatt == null) {
+            result.error('negotiateMtuSize', 'device not connected', null);
+            break;
+           }
+          try {
+            gatt.setBLEMtuSize(mtuSize);
+            const mtuPayload: MtuResultPayload = { mtu: mtuSize };
+            result.success(mtuPayload);
+          } catch (e) {
+            result.error('negotiateMtuSize', (e as BusinessError).message ?? String(e), null);
+          }
+          break;
+        }
+
+        case 'requestConnectionPriority': {
+          const deviceId = args['deviceId'] as string | undefined ?? '';
+          const priority = (args['priority'] as number) ?? 0;
+          try {
+            const gatt = this.connectedDevices.get(deviceId);
+            if (gatt != null) {
+              const gattPriority = gatt as Object as GattWithPriority;
+              gattPriority.requestConnectionPriority(priority);
+            }
+          } catch (e) {
+          }
+          const emptyPayload: Record<string, number> = {};
+          result.success(emptyPayload);
+          break;
+        }
+
+        case 'readRssi': {
+          const deviceId = args['deviceId'] as string | undefined ?? '';
+          const gatt = this.connectedDevices.get(deviceId);
+          if (gatt == null) {
+            result.error('readRssi', 'device not connected', null);
+            break;
+          }
+          try {
+            const rssi = await gatt.getRssiValue();
+            const rssiPayload: RssiResultPayload = { rssi };
+            result.success(rssiPayload);
+          } catch (e) {
+            result.error('readRssi', (e as BusinessError).message ?? String(e), null);
+          }
+          break;
+        }
+
+        default:
+          result.notImplemented();
+      }
+    } catch (e) {
+      result.error('ReactiveBleOhos', String(e), null);
+    }
+  }
+
+  private uuidStr(uuid: ArrayBuffer | string): string {
+    if (typeof uuid === 'string') return uuid;
+    const view = new DataView(uuid);
+    if (uuid.byteLength === 2) {
+      const u = view.getUint16(0, true);
+      return '0000' + u.toString(16).padStart(4, '0') + '-0000-1000-8000-00805f9b34fb';
+    }
+    if (uuid.byteLength !== 16) return '00000000-0000-1000-8000-00805f9b34fb';
+    let s = '';
+    for (let i = 0; i < 16; i++) s += view.getUint8(i).toString(16).padStart(2, '0');
+    return s.replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, '$1-$2-$3-$4-$5');
+  }
+
+  private findCharacteristic(services: ble.GattService[], serviceId: string, characteristicId: string): ble.BLECharacteristic | null {
+    const svcUuid = this.normalizeUuid(serviceId);
+    const charUuid = this.normalizeUuid(characteristicId);
+    for (let i = 0; i < services.length; i++) {
+      const sUuid = this.normalizeUuid(this.uuidStr(services[i].serviceUuid));
+      if (sUuid !== svcUuid) continue;
+      const chars = services[i].characteristics ?? [];
+      for (let j = 0; j < chars.length; j++) {
+        const cUuid = this.normalizeUuid(this.uuidStr(chars[j].characteristicUuid));
+        if (cUuid === charUuid) return chars[j];
+      }
+    }
+    return null;
+  }
+
+  /** 统一为带连字符的小写 128 位 UUID 字符串，便于与 uuidStr() 比较 */
+  private normalizeUuid(u: string): string {
+    const lower = u.toLowerCase().replace(/-/g, '');
+    if (lower.length === 4) return '0000' + lower + '-0000-1000-8000-00805f9b34fb';
+    if (lower.length === 8) return lower + '-0000-1000-8000-00805f9b34fb';
+    if (lower.length === 32) return lower.replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, '$1-$2-$3-$4-$5');
+    return u;
+  }
+
+  /** 构建与 Dart OhosBleCodec.decodeDiscoveredServices 一致的服务列表 */
+  private buildDiscoveredServicesList(deviceId: string, services: ble.GattService[]): DiscoveredService[] {
+    const list: DiscoveredService[] = [];
+    for (let i = 0; i < services.length; i++) {
+      const s = services[i];
+      const serviceId = this.uuidStr(s.serviceUuid);
+      const serviceInstanceId = String(i);
+      const characteristics: DiscoveredChar[] = [];
+      const chars = s.characteristics ?? [];
+      for (let j = 0; j < chars.length; j++) {
+        const c = chars[j];
+        const props = c.properties;
+        const dc: DiscoveredChar = {
+          characteristicId: this.uuidStr(c.characteristicUuid),
+          characteristicInstanceId: String(j),
+          isReadable: props?.read === true,
+          isWritableWithResponse: props?.write === true,
+          isWritableWithoutResponse: props?.writeNoResponse === true,
+          isNotifiable: props?.notify === true,
+          isIndicatable: props?.indicate === true,
+        };
+        characteristics.push(dc);
+      }
+      const includedServices: DiscoveredService[] = [];
+      const inc = s.includeServices ?? [];
+      for (let k = 0; k < inc.length; k++) {
+        const subList = this.buildDiscoveredServicesList(deviceId, [inc[k]]);
+        if (subList.length > 0) includedServices.push(subList[0]);
+      }
+      const svc: DiscoveredService = {
+        serviceId,
+        serviceInstanceId,
+        characteristics,
+        includedServices,
+      };
+      list.push(svc);
+    }
+    return list;
+  }
+}

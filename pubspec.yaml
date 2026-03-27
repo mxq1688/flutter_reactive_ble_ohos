@@ -1,0 +1,33 @@
+name: flutter_reactive_ble_ohos
+description: >
+  HarmonyOS NEXT (OHOS) BLE plugin for Flutter, built on reactive_ble_platform_interface.
+  Provides scan, connect, GATT read/write, notifications, MTU negotiation, connection priority, and RSSI.
+version: 1.0.0
+homepage: https://github.com/mxq/flutter_reactive_ble_ohos
+repository: https://github.com/mxq/flutter_reactive_ble_ohos
+issue_tracker: https://github.com/mxq/flutter_reactive_ble_ohos/issues
+topics:
+  - ble
+  - bluetooth
+  - harmonyos
+  - ohos
+
+environment:
+  sdk: ">=2.17.0 <4.0.0"
+  flutter: ">=2.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  reactive_ble_platform_interface: ^5.4.0
+
+dev_dependencies:
+  flutter_lints: ^3.0.0
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  plugin:
+    platforms:
+      ohos:
+        pluginClass: ReactiveBleOhosPlugin

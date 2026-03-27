@@ -1,0 +1,11 @@
+{
+  "name": "flutter_reactive_ble_ohos",
+  "version": "1.0.0",
+  "description": "HarmonyOS NEXT BLE plugin for Flutter - reactive_ble_ohos",
+  "main": "Index.ets",
+  "author": "mxq",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@ohos/flutter_ohos": "file:libs/flutter.har"
+  }
+}
