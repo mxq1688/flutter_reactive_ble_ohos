@@ -30,7 +30,7 @@ Add this plugin as a dependency. You can use a **git** reference or a **local pa
 dependencies:
   flutter_reactive_ble_ohos:
     git:
-      url: https://github.com/mxq/flutter_reactive_ble_ohos.git
+      url: https://github.com/mxq1688/flutter_reactive_ble_ohos.git
       ref: main
 
 # Or local path (if you copy it into your project)
