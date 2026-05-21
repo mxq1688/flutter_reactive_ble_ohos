@@ -79,6 +79,13 @@ interface ConnStateWithCode {
 interface GattWithPriority {
   requestConnectionPriority(priority: number): void;
 }
+interface MtuNegotiationPending {
+  settled: boolean;
+  clampedMtu: number;
+  resolve: (mtu: number) => void;
+  reject: (reason: Error) => void;
+  timeoutId: number;
+}
 interface CharRef {
   deviceId: string;
   serviceId: string;
@@ -143,16 +150,19 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
   private connectedDevices: Map<string, ble.GattClientDevice> = new Map();
   /** 各设备 GATT 服务发现就绪的 Promise，供连接上报与特征读写复用 */
   private gattServicesReady: Map<string, Promise<ble.GattService[]>> = new Map();
-  private static readonly GATT_READY_MAX_ATTEMPTS = 15;
-  private static readonly GATT_READY_INITIAL_DELAY_MS = 50;
-  private static readonly GATT_READY_MAX_DELAY_MS = 400;
+  private static readonly GATT_READY_MAX_ATTEMPTS = 12;
+  private static readonly GATT_READY_INITIAL_DELAY_MS = 100;
+  private static readonly GATT_READY_MAX_DELAY_MS = 1500;
   private static readonly BLE_ATT_DEFAULT_MTU = 23;
   private static readonly BLE_MTU_MIN = 23;
   private static readonly BLE_MTU_MAX = 517;
   private static readonly MTU_NEGOTIATE_TIMEOUT_MS = 3000;
+  /** Client Characteristic Configuration Descriptor (CCCD) 标准 UUID */
+  private static readonly CCCD_DESCRIPTOR_UUID = '00002902-0000-1000-8000-00805f9b34fb';
   /** 各设备协商后的实际 MTU（由 BLEMtuChange 更新） */
   private negotiatedMtuByDevice: Map<string, number> = new Map();
   private mtuChangeHandlerByDevice: Map<string, (mtu: number) => void> = new Map();
+  private mtuNegotiationPendingByDevice: Map<string, MtuNegotiationPending> = new Map();
   /** 已注册的 BLECharacteristicChange 回调，key 为 deviceId|serviceId|characteristicId */
   private charChangeCallbacks: Map<string, (ch: ble.BLECharacteristic) => void> = new Map();
   /** 正在连接的设备，用于连接超时与状态回调 */
@@ -162,6 +172,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
   private connectTimeoutId: number = -1;
   /** 每次 connectToDevice 递增，用于超时与状态回调互斥 */
   private connectSessionCounter: number = 0;
+  private static readonly MAX_CONNECT_SESSION_ID = 2147483647;
   private connectSessionByDevice: Map<string, number> = new Map();
   private connectStateHandlerByDevice: Map<string, (state: ble.BLEConnectionChangeState) => void> = new Map();
   /** 各设备最近一次连接状态，用于 EventSink 发送失败或重新监听后补发 */
@@ -169,14 +180,19 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
 
   // GattClient 创建优化：防止批量创建导致系统崩溃
   private isScanning: boolean = false;
+  private scanResultHandler: ((data: Array<ble.ScanResult>) => void) | null = null;
   /** 扫描时是否通过临时 GattClient 解析空名称（默认关闭，避免影响后续连接） */
   private resolveScanNamesViaGatt: boolean = false;
   private pendingNameRequests: Set<string> = new Set(); // 正在获取名称的设备
   private completedNameRequests: Set<string> = new Set(); // 已完成名称获取的设备
   private activeGattClients: Map<string, ble.GattClientDevice> = new Map(); // 活跃的临时 GattClient
   private static readonly MAX_CONCURRENT_NAME_REQUESTS = 3; // 最大并发数
+  private static readonly MAX_DISCOVERED_DEVICES = 1000;
+  private static readonly SCAN_CACHE_TRIM_BATCH = 500;
   private nameRequestQueue: Array<string> = []; // 等待队列
   private discoveredDeviceIds: Set<string> = new Set(); // 已发现的设备 ID（用于去重）
+  /** FIFO 顺序，用于在长时间扫描时按最早发现批次淘汰缓存 */
+  private discoveredDeviceIdOrder: string[] = [];
 
   onAttachedToEngine(binding: FlutterPluginBinding): void {
     this.binding = binding;
@@ -219,6 +235,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
         this.emitBleStatus();
       });
     } catch (e) {
+      this.logBleError('failed to register access stateChange listener', e);
     }
   }
 
@@ -227,6 +244,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
       access.off('stateChange');
       ble.off('BLEDeviceFind');
     } catch (e) {
+      this.logBleError('failed to unregister BLE listeners on detach', e);
     }
     this.stopScan();
     this.disconnectAll();
@@ -275,6 +293,10 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     return out;
   }
 
+  private logBleError(context: string, e: object): void {
+    console.error(`ReactiveBleOhos: ${context}: ${(e as BusinessError).message ?? String(e)}`);
+  }
+
   /**
    * 根据蓝牙适配器状态映射为 Dart BleStatus。
    * access.getState() 返回值：STATE_OFF(0), STATE_ON(1), STATE_TURNING_ON(2), STATE_TURNING_OFF(3), STATE_BLE_TURNING_ON(4), STATE_BLE_TURNING_OFF(5), STATE_BLE_ON(6)
@@ -319,8 +341,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     try {
       this.connectionSink?.success(payload);
     } catch (e) {
-      console.error(`ReactiveBleOhos: failed to emit connection update for ${payload.deviceId}: ` +
-        `${(e as BusinessError).message ?? String(e)}`);
+      this.logBleError(`failed to emit connection update for ${payload.deviceId}`, e);
     }
   }
 
@@ -332,8 +353,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
       try {
         this.connectionSink?.success(payload);
       } catch (e) {
-        console.error(`ReactiveBleOhos: failed to flush connection update for ${deviceId}: ` +
-          `${(e as BusinessError).message ?? String(e)}`);
+        this.logBleError(`failed to flush connection update for ${deviceId}`, e);
       }
     });
   }
@@ -359,6 +379,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     try {
       this.charUpdateSink?.success(payload);
     } catch (e) {
+      this.logBleError(`failed to emit characteristic update for ${characteristic.deviceId}`, e);
     }
   }
 
@@ -376,8 +397,15 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
   private stopScan(): void {
     try {
       ble.stopBLEScan();
-      ble.off('BLEDeviceFind');
+      if (this.scanResultHandler != null) {
+        ble.off('BLEDeviceFind', this.scanResultHandler);
+        this.scanResultHandler = null;
+      } else {
+        ble.off('BLEDeviceFind');
+      }
     } catch (e) {
+      this.logBleError('failed to stop BLE scan', e);
+      this.scanResultHandler = null;
     }
     this.isScanning = false;
     this.cleanupPendingNameRequests();
@@ -387,9 +415,42 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     try {
       client.close();
     } catch (e) {
-      console.error(`ReactiveBleOhos: failed to close temporary GattClient for ${deviceId}: ` +
-        `${(e as BusinessError).message ?? String(e)}`);
+      this.logBleError(`failed to close temporary GattClient for ${deviceId}`, e);
     }
+  }
+
+  private clearScanDiscoveryCache(): void {
+    this.discoveredDeviceIds.clear();
+    this.discoveredDeviceIdOrder = [];
+    this.completedNameRequests.clear();
+    this.nameRequestQueue = [];
+  }
+
+  private trimScanDiscoveryCacheIfNeeded(): void {
+    if (this.discoveredDeviceIdOrder.length < ReactiveBleOhosPlugin.MAX_DISCOVERED_DEVICES) {
+      return;
+    }
+    const removeCount = Math.min(ReactiveBleOhosPlugin.SCAN_CACHE_TRIM_BATCH, this.discoveredDeviceIdOrder.length);
+    const removed = this.discoveredDeviceIdOrder.splice(0, removeCount);
+    for (let i = 0; i < removed.length; i++) {
+      const id = removed[i];
+      this.discoveredDeviceIds.delete(id);
+      this.completedNameRequests.delete(id);
+    }
+    this.nameRequestQueue = this.nameRequestQueue.filter(
+      (id: string) => this.discoveredDeviceIds.has(id) || this.pendingNameRequests.has(id)
+    );
+  }
+
+  /** 记录已发现设备；若为新设备返回 true，已存在则返回 false */
+  private trackDiscoveredDevice(deviceId: string): boolean {
+    this.trimScanDiscoveryCacheIfNeeded();
+    if (this.discoveredDeviceIds.has(deviceId)) {
+      return false;
+    }
+    this.discoveredDeviceIds.add(deviceId);
+    this.discoveredDeviceIdOrder.push(deviceId);
+    return true;
   }
 
   private cleanupPendingNameRequests(): void {
@@ -398,9 +459,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     });
     this.activeGattClients.clear();
     this.pendingNameRequests.clear();
-    this.completedNameRequests.clear();
-    this.nameRequestQueue = [];
-    this.discoveredDeviceIds.clear();
+    this.clearScanDiscoveryCache();
   }
 
   private processNameRequestQueue(): void {
@@ -439,29 +498,39 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     tempClient.getDeviceName().then((resolvedName: string) => {
       clearTimeout(timeoutId);
       this.finalizeNameRequest(deviceId, tempClient, resolvedName);
-    }).catch((e: Error) => {
+    }).catch((e: object) => {
       clearTimeout(timeoutId);
+      this.logBleError(`getDeviceName failed for scan name resolution ${deviceId}`, e);
       this.finalizeNameRequest(deviceId, tempClient, null);
     });
   }
 
   private finalizeNameRequest(deviceId: string, client: ble.GattClientDevice, name: string | null): void {
-    this.closeTemporaryGattClient(deviceId, client);
-    this.activeGattClients.delete(deviceId);
-    this.pendingNameRequests.delete(deviceId);
-    this.completedNameRequests.add(deviceId);
-
-    if (name && name.length > 0 && this.isScanning) {
-      const updated: ScanDevicePayload = {
-        id: deviceId,
-        name,
-        rssi: 0,
-        serviceUuids: [],
-        serviceData: {},
-        manufacturerData: [],
-        connectable: CONNECTABLE_UNKNOWN,
-      };
-      this.emitScanResult(updated);
+    if (this.activeGattClients.get(deviceId) !== client) {
+      return;
+    }
+    try {
+      this.closeTemporaryGattClient(deviceId, client);
+    } finally {
+      this.activeGattClients.delete(deviceId);
+      this.pendingNameRequests.delete(deviceId);
+      this.completedNameRequests.add(deviceId);
+    }
+    try {
+      if (name != null && name.length > 0 && this.isScanning) {
+        const updated: ScanDevicePayload = {
+          id: deviceId,
+          name,
+          rssi: 0,
+          serviceUuids: [],
+          serviceData: {},
+          manufacturerData: [],
+          connectable: CONNECTABLE_UNKNOWN,
+        };
+        this.emitScanResult(updated);
+      }
+    } catch (e) {
+      this.logBleError(`failed to emit resolved scan name for ${deviceId}`, e);
     }
     this.processNameRequestQueue();
   }
@@ -479,6 +548,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
         if (advName.length > 0) name = advName;
       }
     } catch (parseErr) {
+      this.logBleError(`failed to parse scan advertisement for ${item.deviceId}`, parseErr);
     }
     const connectable = item.connectable === true ? CONNECTABLE_AVAILABLE :
       (item.connectable === false ? CONNECTABLE_UNAVAILABLE : CONNECTABLE_UNKNOWN);
@@ -494,11 +564,13 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     this.emitScanResult(device);
 
     // 广播名优先；仅当启用 resolveScanNamesViaGatt 且名称为空时才创建临时 GattClient
-    if (this.resolveScanNamesViaGatt && name.length === 0 && !this.discoveredDeviceIds.has(item.deviceId)) {
-      this.discoveredDeviceIds.add(item.deviceId);
+    if (this.resolveScanNamesViaGatt && name.length === 0 && this.trackDiscoveredDevice(item.deviceId)) {
       if (!this.pendingNameRequests.has(item.deviceId) &&
           !this.completedNameRequests.has(item.deviceId) &&
           !this.nameRequestQueue.includes(item.deviceId)) {
+        if (this.nameRequestQueue.length >= ReactiveBleOhosPlugin.MAX_DISCOVERED_DEVICES) {
+          this.nameRequestQueue.shift();
+        }
         this.nameRequestQueue.push(item.deviceId);
         this.processNameRequestQueue();
       }
@@ -516,12 +588,52 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     return this.connectSessionByDevice.get(deviceId) === sessionId;
   }
 
+  private isActiveConnectStateHandler(deviceId: string,
+    onStateChange: (state: ble.BLEConnectionChangeState) => void): boolean {
+    return this.connectStateHandlerByDevice.get(deviceId) === onStateChange;
+  }
+
+  private allocateConnectSessionId(): number {
+    if (this.connectSessionCounter >= ReactiveBleOhosPlugin.MAX_CONNECT_SESSION_ID) {
+      this.connectSessionCounter = 0;
+      this.connectSessionByDevice.clear();
+    }
+    this.connectSessionCounter++;
+    return this.connectSessionCounter;
+  }
+
+  /** 设备已在 connectedDevices 时，等待或重新发起 GATT 发现后再上报 CONNECTED */
+  private emitConnectedWhenGattReady(deviceId: string): void {
+    const gatt = this.connectedDevices.get(deviceId);
+    if (gatt == null) {
+      return;
+    }
+    let promise = this.gattServicesReady.get(deviceId);
+    if (promise == null) {
+      this.beginGattServiceDiscovery(gatt, deviceId);
+      promise = this.gattServicesReady.get(deviceId);
+    }
+    if (promise == null) {
+      return;
+    }
+    promise.then(() => {
+      if (this.connectedDevices.has(deviceId)) {
+        this.emitConnectionUpdate(deviceId, CONN_STATE_CONNECTED);
+      }
+    }).catch(() => {
+      if (this.connectedDevices.has(deviceId)) {
+        this.emitConnectionUpdate(deviceId, CONN_STATE_DISCONNECTED, 'Descriptor discovery failed');
+      }
+    });
+  }
+
   private unregisterConnectStateHandler(deviceId: string, client: ble.GattClientDevice): void {
     const handler = this.connectStateHandlerByDevice.get(deviceId);
     if (handler != null) {
       try {
         client.off('BLEConnectionStateChange', handler);
-      } catch (_) {
+      } catch (e) {
+        this.logBleError(`failed to unregister connection state handler for ${deviceId}`, e);
       }
       this.connectStateHandlerByDevice.delete(deviceId);
     }
@@ -544,15 +656,34 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     if (!this.isActiveConnectSession(deviceId, sessionId)) {
       return;
     }
-    this.clearPendingConnectState(deviceId, sessionId);
+    this.cancelPendingConnectClient(deviceId, client);
+    this.emitConnectionUpdate(deviceId, CONN_STATE_DISCONNECTED, failureMessage);
+  }
+
+  /** 关闭并注销进行中的连接，使旧 session 回调失效；不发送 DISCONNECTED（用于被新连接取代） */
+  private cancelPendingConnectClient(deviceId: string, client: ble.GattClientDevice): void {
+    this.connectSessionByDevice.delete(deviceId);
+    this.clearConnectTimeout();
     this.unregisterMtuChangeCache(deviceId, client);
     this.unregisterConnectStateHandler(deviceId, client);
     try {
       client.close();
-    } catch (_) {
+    } catch (e) {
+      this.logBleError(`failed to close GattClient while cancelling connect for ${deviceId}`, e);
     }
     this.clearGattServicesReady(deviceId);
-    this.emitConnectionUpdate(deviceId, CONN_STATE_DISCONNECTED, failureMessage);
+    if (this.connectingDeviceId === deviceId) {
+      this.connectingDeviceId = null;
+      this.connectingClient = null;
+    }
+  }
+
+  /** 同一设备重复 connect 时，先取消尚未完成的连接，避免 session 被覆盖后旧回调误判 */
+  private supersedePendingConnect(deviceId: string): void {
+    if (this.connectingDeviceId !== deviceId || this.connectingClient == null) {
+      return;
+    }
+    this.cancelPendingConnectClient(deviceId, this.connectingClient);
   }
 
   private clearGattServicesReady(deviceId?: string): void {
@@ -569,7 +700,18 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     });
   }
 
-  /** 服务列表非空，且需 CCCD 的特征其 descriptors 已就绪 */
+  private hasCccdDescriptor(descriptors: ble.BLEDescriptor[]): boolean {
+    const cccdUuid = ReactiveBleOhosPlugin.CCCD_DESCRIPTOR_UUID;
+    for (let k = 0; k < descriptors.length; k++) {
+      const descUuid = this.normalizeUuid(this.uuidStr(descriptors[k].descriptorUuid));
+      if (descUuid === cccdUuid) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** 服务列表非空，且需 CCCD 的 notify/indicate 特征已包含 0x2902 descriptor */
   private areGattServicesReady(services: ble.GattService[]): boolean {
     if (services.length === 0) {
       return false;
@@ -580,12 +722,9 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
       for (let j = 0; j < chars.length; j++) {
         hasCharacteristic = true;
         const c = chars[j];
-        const needsDescriptor = c.properties?.notify === true || c.properties?.indicate === true;
-        if (needsDescriptor) {
-          const descs = c.descriptors ?? [];
-          if (descs.length === 0) {
-            return false;
-          }
+        const needsCccd = c.properties?.notify === true || c.properties?.indicate === true;
+        if (needsCccd && !this.hasCccdDescriptor(c.descriptors ?? [])) {
+          return false;
         }
       }
     }
@@ -605,7 +744,8 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
           return services;
         }
         lastServices = services;
-      } catch (_) {
+      } catch (e) {
+        this.logBleError(`GATT getServices attempt failed for ${deviceId}`, e);
       }
       await this.delayMs(delay);
       delay = Math.min(delay * 2, ReactiveBleOhosPlugin.GATT_READY_MAX_DELAY_MS);
@@ -637,7 +777,8 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     this.unregisterConnectStateHandler(deviceId, client);
     try {
       client.close();
-    } catch (_) {
+    } catch (e) {
+      this.logBleError(`failed to close GattClient after GATT discovery failed for ${deviceId}`, e);
     }
     this.emitConnectionUpdate(deviceId, CONN_STATE_DISCONNECTED, failureMessage);
   }
@@ -647,26 +788,71 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     this.gattServicesReady.set(deviceId, promise);
   }
 
-  private registerMtuChangeCache(deviceId: string, client: ble.GattClientDevice): void {
-    this.unregisterMtuChangeCache(deviceId, client);
-    const handler = (mtu: number) => {
-      if (mtu >= ReactiveBleOhosPlugin.BLE_MTU_MIN) {
-        this.negotiatedMtuByDevice.set(deviceId, mtu);
+  private onMtuChanged(deviceId: string, mtu: number): void {
+    const pending = this.mtuNegotiationPendingByDevice.get(deviceId);
+    if (pending != null && !pending.settled) {
+      pending.settled = true;
+      if (pending.timeoutId >= 0) {
+        clearTimeout(pending.timeoutId);
       }
+      let actual: number;
+      if (mtu >= ReactiveBleOhosPlugin.BLE_MTU_MIN) {
+        actual = mtu;
+      } else {
+        actual = ReactiveBleOhosPlugin.BLE_ATT_DEFAULT_MTU;
+        this.logBleError(`MTU negotiation returned invalid value ${mtu} for ${deviceId}, using default ${actual}`,
+          new Error('invalid MTU'));
+      }
+      this.negotiatedMtuByDevice.set(deviceId, actual);
+      pending.resolve(actual);
+      this.mtuNegotiationPendingByDevice.delete(deviceId);
+      return;
+    }
+    if (mtu >= ReactiveBleOhosPlugin.BLE_MTU_MIN) {
+      this.negotiatedMtuByDevice.set(deviceId, mtu);
+    }
+  }
+
+  private ensureMtuChangeHandler(deviceId: string, client: ble.GattClientDevice): void {
+    if (this.mtuChangeHandlerByDevice.has(deviceId)) {
+      return;
+    }
+    const handler = (mtu: number): void => {
+      this.onMtuChanged(deviceId, mtu);
     };
     this.mtuChangeHandlerByDevice.set(deviceId, handler);
     try {
       client.on('BLEMtuChange', handler);
-    } catch (_) {
+    } catch (e) {
+      this.logBleError(`failed to register BLEMtuChange handler for ${deviceId}`, e);
     }
   }
 
+  private clearMtuNegotiationPending(deviceId: string, reason: string): void {
+    const pending = this.mtuNegotiationPendingByDevice.get(deviceId);
+    if (pending == null || pending.settled) {
+      return;
+    }
+    pending.settled = true;
+    if (pending.timeoutId >= 0) {
+      clearTimeout(pending.timeoutId);
+    }
+    pending.reject(new Error(reason));
+    this.mtuNegotiationPendingByDevice.delete(deviceId);
+  }
+
+  private registerMtuChangeCache(deviceId: string, client: ble.GattClientDevice): void {
+    this.ensureMtuChangeHandler(deviceId, client);
+  }
+
   private unregisterMtuChangeCache(deviceId: string, client?: ble.GattClientDevice): void {
+    this.clearMtuNegotiationPending(deviceId, 'MTU negotiation cancelled');
     const handler = this.mtuChangeHandlerByDevice.get(deviceId);
     if (handler != null && client != null) {
       try {
         client.off('BLEMtuChange', handler);
-      } catch (_) {
+      } catch (e) {
+        this.logBleError(`failed to unregister BLEMtuChange handler for ${deviceId}`, e);
       }
     }
     this.mtuChangeHandlerByDevice.delete(deviceId);
@@ -677,44 +863,42 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     requestedMtu: number): Promise<number> {
     const clampedMtu = Math.max(ReactiveBleOhosPlugin.BLE_MTU_MIN,
       Math.min(ReactiveBleOhosPlugin.BLE_MTU_MAX, requestedMtu));
+    this.ensureMtuChangeHandler(deviceId, gatt);
+    const existing = this.mtuNegotiationPendingByDevice.get(deviceId);
+    if (existing != null && !existing.settled) {
+      existing.settled = true;
+      if (existing.timeoutId >= 0) {
+        clearTimeout(existing.timeoutId);
+      }
+      existing.reject(new Error('superseded by new MTU negotiation'));
+      this.mtuNegotiationPendingByDevice.delete(deviceId);
+    }
     return new Promise<number>((resolve: (mtu: number) => void, reject: (reason: Error) => void) => {
-      let settled = false;
-      const mtuHandler = (mtu: number) => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        clearTimeout(timeoutId);
-        try {
-          gatt.off('BLEMtuChange', mtuHandler);
-        } catch (_) {
-        }
-        const actual = mtu >= ReactiveBleOhosPlugin.BLE_MTU_MIN ? mtu : clampedMtu;
-        this.negotiatedMtuByDevice.set(deviceId, actual);
-        resolve(actual);
+      const pending: MtuNegotiationPending = {
+        settled: false,
+        clampedMtu,
+        resolve,
+        reject,
+        timeoutId: -1,
       };
-      const timeoutId = setTimeout(() => {
-        if (settled) {
+      pending.timeoutId = setTimeout(() => {
+        if (pending.settled) {
           return;
         }
-        settled = true;
-        try {
-          gatt.off('BLEMtuChange', mtuHandler);
-        } catch (_) {
-        }
+        pending.settled = true;
+        this.mtuNegotiationPendingByDevice.delete(deviceId);
         const fallback = this.negotiatedMtuByDevice.get(deviceId) ?? ReactiveBleOhosPlugin.BLE_ATT_DEFAULT_MTU;
-        resolve(fallback);
+        reject(new Error(`MTU negotiation timeout, last known MTU: ${fallback}`));
       }, ReactiveBleOhosPlugin.MTU_NEGOTIATE_TIMEOUT_MS) as number;
+      this.mtuNegotiationPendingByDevice.set(deviceId, pending);
       try {
-        gatt.on('BLEMtuChange', mtuHandler);
         gatt.setBLEMtuSize(clampedMtu);
       } catch (e) {
-        settled = true;
-        clearTimeout(timeoutId);
-        try {
-          gatt.off('BLEMtuChange', mtuHandler);
-        } catch (_) {
+        pending.settled = true;
+        if (pending.timeoutId >= 0) {
+          clearTimeout(pending.timeoutId);
         }
+        this.mtuNegotiationPendingByDevice.delete(deviceId);
         reject(new Error((e as BusinessError).message ?? String(e)));
       }
     });
@@ -732,30 +916,42 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     }
     try {
       return await promise;
-    } catch (_) {
+    } catch (e) {
+      this.gattServicesReady.delete(deviceId);
+      this.logBleError(`GATT services not ready for ${deviceId}`, e);
       return null;
     }
   }
 
   private disconnectAll(): void {
-    this.charChangeCallbacks.clear();
     this.clearGattServicesReady();
     this.clearConnectTimeout();
     this.connectSessionByDevice.clear();
-    this.connectStateHandlerByDevice.clear();
-    this.connectedDevices.forEach((gatt, deviceId) => {
+
+    this.connectedDevices.forEach((gatt: ble.GattClientDevice, deviceId: string) => {
+      this.removeCharChangeCallbacksForDevice(deviceId, gatt);
       this.unregisterMtuChangeCache(deviceId, gatt);
+      this.unregisterConnectStateHandler(deviceId, gatt);
+    });
+    this.charChangeCallbacks.clear();
+    this.connectStateHandlerByDevice.clear();
+
+    this.connectedDevices.forEach((gatt: ble.GattClientDevice, deviceId: string) => {
       try {
         gatt.disconnect();
         gatt.close();
       } catch (e) {
+        this.logBleError(`failed to close GattClient for ${deviceId}`, e);
       }
     });
     this.connectedDevices.clear();
+
     if (this.connectingClient != null && this.connectingDeviceId != null) {
+      this.unregisterConnectStateHandler(this.connectingDeviceId, this.connectingClient);
       try {
         this.connectingClient.close();
       } catch (e) {
+        this.logBleError(`failed to close connectingClient for ${this.connectingDeviceId}`, e);
       }
       this.connectingClient = null;
       this.connectingDeviceId = null;
@@ -908,11 +1104,8 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
           this.resolveScanNamesViaGatt = (args['resolveDeviceNamesViaGatt'] as boolean) ?? false;
 
           this.stopScan();
-          // 重置名称请求状态
           this.pendingNameRequests.clear();
-          this.nameRequestQueue = [];
-          this.completedNameRequests.clear();
-          this.discoveredDeviceIds.clear();
+          this.clearScanDiscoveryCache();
 
           const filterArray: ble.ScanFilter[] = [];
           for (let i = 0; i < withServices.length; i++) {
@@ -924,12 +1117,13 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
             matchMode: ble.MatchMode.MATCH_MODE_AGGRESSIVE,
             interval: 0,
           };
-          ble.on('BLEDeviceFind', (data: Array<ble.ScanResult>) => {
+          this.scanResultHandler = (data: Array<ble.ScanResult>): void => {
             if (data.length === 0) return;
             for (let i = 0; i < data.length; i++) {
               this.handleBleScanResult(data[i]);
             }
-          });
+          };
+          ble.on('BLEDeviceFind', this.scanResultHandler);
           if (filterArray.length === 0) {
             ble.startBLEScan(null, scanOption);
           } else {
@@ -945,34 +1139,25 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
           const timeoutInMs = (args['timeoutInMs'] as number) ?? 0;
 
           if (this.connectedDevices.has(deviceId)) {
-            const readyPromise = this.gattServicesReady.get(deviceId);
-            if (readyPromise != null) {
-              readyPromise.then(() => {
-                this.emitConnectionUpdate(deviceId, CONN_STATE_CONNECTED);
-              }).catch(() => {
-                this.emitConnectionUpdate(deviceId, CONN_STATE_DISCONNECTED, 'Descriptor discovery failed');
-              });
-            } else {
-              this.emitConnectionUpdate(deviceId, CONN_STATE_CONNECTED);
-            }
+            this.emitConnectedWhenGattReady(deviceId);
             result.success(null);
             break;
           }
-          if (this.connectingDeviceId === deviceId) {
-            result.success(null);
-            break;
-          }
+          this.supersedePendingConnect(deviceId);
           this.emitConnectionUpdate(deviceId, CONN_STATE_CONNECTING);
+          let client: ble.GattClientDevice | null = null;
           try {
-            const client = ble.createGattClientDevice(deviceId);
-            this.connectSessionCounter++;
-            const sessionId = this.connectSessionCounter;
+            client = ble.createGattClientDevice(deviceId);
+            const sessionId = this.allocateConnectSessionId();
             this.connectSessionByDevice.set(deviceId, sessionId);
             this.connectingDeviceId = deviceId;
             this.connectingClient = client;
 
             const onStateChange = (state: ble.BLEConnectionChangeState) => {
               if (state.deviceId !== deviceId) {
+                return;
+              }
+              if (!this.isActiveConnectStateHandler(deviceId, onStateChange)) {
                 return;
               }
               const isPendingSession = this.isActiveConnectSession(deviceId, sessionId);
@@ -1002,7 +1187,8 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
                   this.unregisterConnectStateHandler(deviceId, client);
                   try {
                     client.close();
-                  } catch (_) {
+                  } catch (e) {
+                    this.logBleError(`failed to close GattClient on disconnect for ${deviceId}`, e);
                   }
                   this.emitConnectionUpdate(deviceId, CONN_STATE_DISCONNECTED, msg);
                 }
@@ -1019,15 +1205,24 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
               }, timeoutInMs);
               this.connectTimeoutId = timeoutId as number;
             }
+            result.success(null);
           } catch (e) {
             this.clearConnectTimeout();
             this.connectSessionByDevice.delete(deviceId);
+            if (client != null) {
+              this.unregisterConnectStateHandler(deviceId, client);
+              try {
+                client.close();
+              } catch (closeErr) {
+                this.logBleError(`failed to close GattClient after connect error for ${deviceId}`, closeErr);
+              }
+            }
             const msg = (e as BusinessError).message ?? String(e);
             this.emitConnectionUpdate(deviceId, CONN_STATE_DISCONNECTED, msg);
             this.connectingDeviceId = null;
             this.connectingClient = null;
+            result.error('connectToDevice', msg, null);
           }
-          result.success(null);
           break;
         }
 
@@ -1045,6 +1240,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
               gatt.disconnect();
               gatt.close();
             } catch (e) {
+              this.logBleError(`failed to disconnect GattClient for ${deviceId}`, e);
             }
             this.connectedDevices.delete(deviceId);
           }
@@ -1053,6 +1249,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
             try {
               this.connectingClient.close();
             } catch (e) {
+              this.logBleError(`failed to close pending connecting GattClient for ${deviceId}`, e);
             }
             this.connectingClient = null;
             this.connectingDeviceId = null;
@@ -1193,36 +1390,52 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
             }
             const charFound = this.findCharacteristic(services, serviceId, characteristicId);
             if (charFound != null) {
-              if (charFound.properties?.notify === true) {
-                await gatt.setCharacteristicChangeNotification(charFound, true);
-              } else if (charFound.properties?.indicate === true) {
-                await gatt.setCharacteristicChangeIndication(charFound, true);
-              }
               const callbackKey = this.charChangeCallbackKey(deviceId, serviceId, characteristicId);
-              if (!this.charChangeCallbacks.has(callbackKey)) {
-                const normServiceId = this.normalizeUuid(serviceId);
-                const normCharId = this.normalizeUuid(characteristicId);
-                const callback = (ch: ble.BLECharacteristic): void => {
-                  const chServiceId = this.normalizeUuid(this.uuidStr(ch.serviceUuid));
-                  const chCharId = this.normalizeUuid(this.uuidStr(ch.characteristicUuid));
-                  if (chServiceId !== normServiceId || chCharId !== normCharId) {
-                    return;
-                  }
-                  const c: CharRef = {
-                    deviceId,
-                    serviceId: this.uuidStr(ch.serviceUuid),
-                    serviceInstanceId,
-                    characteristicId: this.uuidStr(ch.characteristicUuid),
-                    characteristicInstanceId,
+              let newCallbackRegistered = false;
+              let notificationEnabled = false;
+              try {
+                if (!this.charChangeCallbacks.has(callbackKey)) {
+                  const normServiceId = this.normalizeUuid(serviceId);
+                  const normCharId = this.normalizeUuid(characteristicId);
+                  const callback = (ch: ble.BLECharacteristic): void => {
+                    const chServiceId = this.normalizeUuid(this.uuidStr(ch.serviceUuid));
+                    const chCharId = this.normalizeUuid(this.uuidStr(ch.characteristicUuid));
+                    if (chServiceId !== normServiceId || chCharId !== normCharId) {
+                      return;
+                    }
+                    const c: CharRef = {
+                      deviceId,
+                      serviceId: this.uuidStr(ch.serviceUuid),
+                      serviceInstanceId,
+                      characteristicId: this.uuidStr(ch.characteristicUuid),
+                      characteristicInstanceId,
+                    };
+                    const val = this.characteristicValueToNumberArray(ch.characteristicValue);
+                    this.emitCharValue(c, val);
                   };
-                  const val = this.characteristicValueToNumberArray(ch.characteristicValue);
-                  this.emitCharValue(c, val);
-                };
-                gatt.on('BLECharacteristicChange', callback);
-                this.charChangeCallbacks.set(callbackKey, callback);
+                  gatt.on('BLECharacteristicChange', callback);
+                  this.charChangeCallbacks.set(callbackKey, callback);
+                  newCallbackRegistered = true;
+                }
+                await this.enableCharacteristicNotifications(gatt, charFound);
+                notificationEnabled = true;
+              } catch (e) {
+                if (notificationEnabled) {
+                  try {
+                    await this.disableCharacteristicNotifications(gatt, charFound);
+                  } catch (cleanupErr) {
+                    this.logBleError(`failed to disable notification after readNotifications error for ${deviceId}`,
+                      cleanupErr);
+                  }
+                }
+                if (newCallbackRegistered) {
+                  this.unregisterCharChangeCallback(deviceId, serviceId, characteristicId, gatt);
+                }
+                this.logBleError(`readNotifications failed for ${deviceId}`, e);
               }
             }
           } catch (e) {
+            this.logBleError(`readNotifications failed for ${deviceId}`, e);
           }
           result.success(null);
           break;
@@ -1239,25 +1452,13 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
               if (services != null) {
                 const charFound = this.findCharacteristic(services, serviceId, characteristicId);
                 if (charFound != null) {
-                  if (charFound.properties?.notify === true) {
-                    await gatt.setCharacteristicChangeNotification(charFound, false);
-                  }
-                  if (charFound.properties?.indicate === true) {
-                    await gatt.setCharacteristicChangeIndication(charFound, false);
-                  }
+                  await this.disableCharacteristicNotifications(gatt, charFound);
                 }
               }
             } catch (e) {
+              this.logBleError(`stopNotifications failed for ${deviceId}`, e);
             }
-            const callbackKey = this.charChangeCallbackKey(deviceId, serviceId, characteristicId);
-            const existingCallback = this.charChangeCallbacks.get(callbackKey);
-            if (existingCallback != null) {
-              try {
-                gatt.off('BLECharacteristicChange', existingCallback);
-              } catch (e) {
-              }
-              this.charChangeCallbacks.delete(callbackKey);
-            }
+            this.unregisterCharChangeCallback(deviceId, serviceId, characteristicId, gatt);
           }
           result.success(null);
           break;
@@ -1290,6 +1491,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
               gattPriority.requestConnectionPriority(priority);
             }
           } catch (e) {
+            this.logBleError(`requestConnectionPriority failed for ${deviceId}`, e);
           }
           const emptyPayload: Record<string, number> = {};
           result.success(emptyPayload);
@@ -1378,6 +1580,39 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     return null;
   }
 
+  private async enableCharacteristicNotifications(gatt: ble.GattClientDevice,
+    charFound: ble.BLECharacteristic): Promise<void> {
+    if (charFound.properties?.notify === true) {
+      await gatt.setCharacteristicChangeNotification(charFound, true);
+    } else if (charFound.properties?.indicate === true) {
+      await gatt.setCharacteristicChangeIndication(charFound, true);
+    }
+  }
+
+  private async disableCharacteristicNotifications(gatt: ble.GattClientDevice,
+    charFound: ble.BLECharacteristic): Promise<void> {
+    if (charFound.properties?.notify === true) {
+      await gatt.setCharacteristicChangeNotification(charFound, false);
+    }
+    if (charFound.properties?.indicate === true) {
+      await gatt.setCharacteristicChangeIndication(charFound, false);
+    }
+  }
+
+  private unregisterCharChangeCallback(deviceId: string, serviceId: string, characteristicId: string,
+    gatt: ble.GattClientDevice): void {
+    const callbackKey = this.charChangeCallbackKey(deviceId, serviceId, characteristicId);
+    const existingCallback = this.charChangeCallbacks.get(callbackKey);
+    if (existingCallback != null) {
+      try {
+        gatt.off('BLECharacteristicChange', existingCallback);
+      } catch (e) {
+        this.logBleError(`failed to unregister characteristic change callback for ${deviceId}`, e);
+      }
+      this.charChangeCallbacks.delete(callbackKey);
+    }
+  }
+
   private charChangeCallbackKey(deviceId: string, serviceId: string, characteristicId: string): string {
     return `${deviceId}|${this.normalizeUuid(serviceId)}|${this.normalizeUuid(characteristicId)}`;
   }
@@ -1390,7 +1625,8 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
         if (gatt != null) {
           try {
             gatt.off('BLECharacteristicChange', callback);
-          } catch (_) {
+          } catch (e) {
+            this.logBleError(`failed to unregister characteristic change callback for ${deviceId}`, e);
           }
         }
       }
