@@ -153,7 +153,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
   /** 各设备协商后的实际 MTU（由 BLEMtuChange 更新） */
   private negotiatedMtuByDevice: Map<string, number> = new Map();
   private mtuChangeHandlerByDevice: Map<string, (mtu: number) => void> = new Map();
-  /** 已注册的 BLECharacteristicChange 回调，key 为 deviceId，用于 stopNotifications 时移除 */
+  /** 已注册的 BLECharacteristicChange 回调，key 为 deviceId|serviceId|characteristicId */
   private charChangeCallbacks: Map<string, (ch: ble.BLECharacteristic) => void> = new Map();
   /** 正在连接的设备，用于连接超时与状态回调 */
   private connectingDeviceId: string | null = null;
@@ -164,6 +164,8 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
   private connectSessionCounter: number = 0;
   private connectSessionByDevice: Map<string, number> = new Map();
   private connectStateHandlerByDevice: Map<string, (state: ble.BLEConnectionChangeState) => void> = new Map();
+  /** 各设备最近一次连接状态，用于 EventSink 发送失败或重新监听后补发 */
+  private lastConnectionStateByDevice: Map<string, ConnectionPayload> = new Map();
 
   // GattClient 创建优化：防止批量创建导致系统崩溃
   private isScanning: boolean = false;
@@ -189,7 +191,10 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
 
     this.connectionChannel = new EventChannel(binding.getBinaryMessenger(), EVENT_CONNECTION);
     this.connectionChannel.setStreamHandler(this.createStreamHandler(
-      (sink: EventSink) => { this.connectionSink = sink; },
+      (sink: EventSink) => {
+        this.connectionSink = sink;
+        this.flushPendingConnectionUpdates();
+      },
       () => { this.connectionSink = null; }
     ));
 
@@ -234,6 +239,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     this.connectionSink = null;
     this.charUpdateSink = null;
     this.bleStatusSink = null;
+    this.lastConnectionStateByDevice.clear();
     this.methodChannel = null;
     this.scanChannel = null;
     this.connectionChannel = null;
@@ -296,7 +302,8 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     }
   }
 
-  private emitConnectionUpdate(deviceId: string, connectionState: number, failureMessage?: string): void {
+  private buildConnectionPayload(deviceId: string, connectionState: number,
+    failureMessage?: string): ConnectionPayload {
     const payload: ConnectionPayload = {
       deviceId,
       connectionState,
@@ -304,10 +311,35 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     if (failureMessage !== undefined && failureMessage.length > 0) {
       payload.failureMessage = failureMessage;
     }
+    return payload;
+  }
+
+  private emitConnectionPayload(payload: ConnectionPayload): void {
+    this.lastConnectionStateByDevice.set(payload.deviceId, payload);
     try {
       this.connectionSink?.success(payload);
     } catch (e) {
+      console.error(`ReactiveBleOhos: failed to emit connection update for ${payload.deviceId}: ` +
+        `${(e as BusinessError).message ?? String(e)}`);
     }
+  }
+
+  private flushPendingConnectionUpdates(): void {
+    if (this.connectionSink == null) {
+      return;
+    }
+    this.lastConnectionStateByDevice.forEach((payload: ConnectionPayload, deviceId: string) => {
+      try {
+        this.connectionSink?.success(payload);
+      } catch (e) {
+        console.error(`ReactiveBleOhos: failed to flush connection update for ${deviceId}: ` +
+          `${(e as BusinessError).message ?? String(e)}`);
+      }
+    });
+  }
+
+  private emitConnectionUpdate(deviceId: string, connectionState: number, failureMessage?: string): void {
+    this.emitConnectionPayload(this.buildConnectionPayload(deviceId, connectionState, failureMessage));
   }
 
   private emitScanResult(device: ScanDevicePayload | null, error?: string): void {
@@ -351,12 +383,18 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     this.cleanupPendingNameRequests();
   }
 
+  private closeTemporaryGattClient(deviceId: string, client: ble.GattClientDevice): void {
+    try {
+      client.close();
+    } catch (e) {
+      console.error(`ReactiveBleOhos: failed to close temporary GattClient for ${deviceId}: ` +
+        `${(e as BusinessError).message ?? String(e)}`);
+    }
+  }
+
   private cleanupPendingNameRequests(): void {
-    // 关闭所有活跃的临时 GattClient
     this.activeGattClients.forEach((client: ble.GattClientDevice, deviceId: string) => {
-      try {
-        client.close();
-      } catch (_) {}
+      this.closeTemporaryGattClient(deviceId, client);
     });
     this.activeGattClients.clear();
     this.pendingNameRequests.clear();
@@ -408,7 +446,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
   }
 
   private finalizeNameRequest(deviceId: string, client: ble.GattClientDevice, name: string | null): void {
-    try { client.close(); } catch (_) {}
+    this.closeTemporaryGattClient(deviceId, client);
     this.activeGattClients.delete(deviceId);
     this.pendingNameRequests.delete(deviceId);
     this.completedNameRequests.add(deviceId);
@@ -572,10 +610,36 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
       await this.delayMs(delay);
       delay = Math.min(delay * 2, ReactiveBleOhosPlugin.GATT_READY_MAX_DELAY_MS);
     }
-    if (lastServices.length > 0) {
+    if (this.areGattServicesReady(lastServices)) {
       return lastServices;
     }
+    if (lastServices.length > 0) {
+      throw new Error('Descriptor discovery failed');
+    }
     throw new Error('GATT service discovery timed out');
+  }
+
+  private onGattDiscoverySucceeded(deviceId: string, client: ble.GattClientDevice): void {
+    if (this.connectedDevices.get(deviceId) !== client) {
+      return;
+    }
+    this.registerMtuChangeCache(deviceId, client);
+    this.emitConnectionUpdate(deviceId, CONN_STATE_CONNECTED);
+  }
+
+  private onGattDiscoveryFailed(deviceId: string, client: ble.GattClientDevice, failureMessage: string): void {
+    if (this.connectedDevices.get(deviceId) !== client) {
+      return;
+    }
+    this.connectedDevices.delete(deviceId);
+    this.clearGattServicesReady(deviceId);
+    this.unregisterMtuChangeCache(deviceId, client);
+    this.unregisterConnectStateHandler(deviceId, client);
+    try {
+      client.close();
+    } catch (_) {
+    }
+    this.emitConnectionUpdate(deviceId, CONN_STATE_DISCONNECTED, failureMessage);
   }
 
   private beginGattServiceDiscovery(gatt: ble.GattClientDevice, deviceId: string): void {
@@ -696,6 +760,31 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
       this.connectingClient = null;
       this.connectingDeviceId = null;
     }
+  }
+
+  /**
+   * 将 BLECharacteristic.characteristicValue 转为 Dart 层使用的 number[]。
+   * HarmonyOS 返回值可能是 ArrayBuffer、Uint8Array 或 number[]。
+   */
+  private characteristicValueToNumberArray(raw: object | null | undefined): number[] {
+    if (raw == null) {
+      return [];
+    }
+    if (raw instanceof ArrayBuffer) {
+      return Array.from(new Uint8Array(raw));
+    }
+    if (raw instanceof Uint8Array) {
+      return Array.from(raw);
+    }
+    if (Array.isArray(raw)) {
+      const arr = raw as number[];
+      const out: number[] = [];
+      for (let i = 0; i < arr.length; i++) {
+        out.push(arr[i]);
+      }
+      return out;
+    }
+    return [];
   }
 
   /**
@@ -856,7 +945,16 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
           const timeoutInMs = (args['timeoutInMs'] as number) ?? 0;
 
           if (this.connectedDevices.has(deviceId)) {
-            this.emitConnectionUpdate(deviceId, CONN_STATE_CONNECTED);
+            const readyPromise = this.gattServicesReady.get(deviceId);
+            if (readyPromise != null) {
+              readyPromise.then(() => {
+                this.emitConnectionUpdate(deviceId, CONN_STATE_CONNECTED);
+              }).catch(() => {
+                this.emitConnectionUpdate(deviceId, CONN_STATE_DISCONNECTED, 'Descriptor discovery failed');
+              });
+            } else {
+              this.emitConnectionUpdate(deviceId, CONN_STATE_CONNECTED);
+            }
             result.success(null);
             break;
           }
@@ -887,23 +985,10 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
                 this.connectedDevices.set(deviceId, client);
                 this.beginGattServiceDiscovery(client, deviceId);
                 this.gattServicesReady.get(deviceId)!.then(() => {
-                  if (this.connectedDevices.get(deviceId) === client) {
-                    this.registerMtuChangeCache(deviceId, client);
-                    this.emitConnectionUpdate(deviceId, CONN_STATE_CONNECTED);
-                  }
+                  this.onGattDiscoverySucceeded(deviceId, client);
                 }).catch((_err: object) => {
-                  if (this.connectedDevices.get(deviceId) !== client) {
-                    return;
-                  }
-                  this.connectedDevices.delete(deviceId);
-                  this.clearGattServicesReady(deviceId);
-                  this.unregisterMtuChangeCache(deviceId, client);
-                  this.unregisterConnectStateHandler(deviceId, client);
-                  try {
-                    client.close();
-                  } catch (_) {
-                  }
-                  this.emitConnectionUpdate(deviceId, CONN_STATE_DISCONNECTED, 'Service discovery failed');
+                  const msg = (_err as Error).message ?? 'Descriptor discovery failed';
+                  this.onGattDiscoveryFailed(deviceId, client, msg);
                 });
               } else if (state.state === constant.ProfileConnectionState.STATE_DISCONNECTED) {
                 const stateWithCode = state as ConnStateWithCode;
@@ -950,9 +1035,9 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
           const deviceId = args['deviceId'] as string | undefined ?? '';
           this.connectSessionByDevice.delete(deviceId);
           this.clearConnectTimeout();
-          this.charChangeCallbacks.delete(deviceId);
-          this.clearGattServicesReady(deviceId);
           const gatt = this.connectedDevices.get(deviceId);
+          this.removeCharChangeCallbacksForDevice(deviceId, gatt ?? undefined);
+          this.clearGattServicesReady(deviceId);
           if (gatt != null) {
             this.unregisterMtuChangeCache(deviceId, gatt);
             this.unregisterConnectStateHandler(deviceId, gatt);
@@ -1031,7 +1116,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
               break;
             }
             const readChar = await gatt.readCharacteristicValue(charFound);
-            const value = readChar.characteristicValue != null ? Array.from(new Uint8Array(readChar.characteristicValue)) : [];
+            const value = this.characteristicValueToNumberArray(readChar.characteristicValue);
             this.emitCharValue(characteristic, value);
           } catch (e) {
             this.emitCharValue(characteristic, undefined, (e as BusinessError).message ?? String(e));
@@ -1113,8 +1198,16 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
               } else if (charFound.properties?.indicate === true) {
                 await gatt.setCharacteristicChangeIndication(charFound, true);
               }
-              if (!this.charChangeCallbacks.has(deviceId)) {
+              const callbackKey = this.charChangeCallbackKey(deviceId, serviceId, characteristicId);
+              if (!this.charChangeCallbacks.has(callbackKey)) {
+                const normServiceId = this.normalizeUuid(serviceId);
+                const normCharId = this.normalizeUuid(characteristicId);
                 const callback = (ch: ble.BLECharacteristic): void => {
+                  const chServiceId = this.normalizeUuid(this.uuidStr(ch.serviceUuid));
+                  const chCharId = this.normalizeUuid(this.uuidStr(ch.characteristicUuid));
+                  if (chServiceId !== normServiceId || chCharId !== normCharId) {
+                    return;
+                  }
                   const c: CharRef = {
                     deviceId,
                     serviceId: this.uuidStr(ch.serviceUuid),
@@ -1122,11 +1215,11 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
                     characteristicId: this.uuidStr(ch.characteristicUuid),
                     characteristicInstanceId,
                   };
-                  const val = ch.characteristicValue != null ? Array.from(new Uint8Array(ch.characteristicValue as ArrayBuffer)) : [];
+                  const val = this.characteristicValueToNumberArray(ch.characteristicValue);
                   this.emitCharValue(c, val);
                 };
                 gatt.on('BLECharacteristicChange', callback);
-                this.charChangeCallbacks.set(deviceId, callback);
+                this.charChangeCallbacks.set(callbackKey, callback);
               }
             }
           } catch (e) {
@@ -1156,13 +1249,14 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
               }
             } catch (e) {
             }
-            const existingCallback = this.charChangeCallbacks.get(deviceId);
-            if (existingCallback) {
+            const callbackKey = this.charChangeCallbackKey(deviceId, serviceId, characteristicId);
+            const existingCallback = this.charChangeCallbacks.get(callbackKey);
+            if (existingCallback != null) {
               try {
                 gatt.off('BLECharacteristicChange', existingCallback);
               } catch (e) {
               }
-              this.charChangeCallbacks.delete(deviceId);
+              this.charChangeCallbacks.delete(callbackKey);
             }
           }
           result.success(null);
@@ -1282,6 +1376,28 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
       }
     }
     return null;
+  }
+
+  private charChangeCallbackKey(deviceId: string, serviceId: string, characteristicId: string): string {
+    return `${deviceId}|${this.normalizeUuid(serviceId)}|${this.normalizeUuid(characteristicId)}`;
+  }
+
+  private removeCharChangeCallbacksForDevice(deviceId: string, gatt?: ble.GattClientDevice): void {
+    const keysToRemove: string[] = [];
+    this.charChangeCallbacks.forEach((callback, key) => {
+      if (key.startsWith(`${deviceId}|`)) {
+        keysToRemove.push(key);
+        if (gatt != null) {
+          try {
+            gatt.off('BLECharacteristicChange', callback);
+          } catch (_) {
+          }
+        }
+      }
+    });
+    for (let i = 0; i < keysToRemove.length; i++) {
+      this.charChangeCallbacks.delete(keysToRemove[i]);
+    }
   }
 
   /** 统一为带连字符的小写 128 位 UUID 字符串，便于与 uuidStr() 比较 */
