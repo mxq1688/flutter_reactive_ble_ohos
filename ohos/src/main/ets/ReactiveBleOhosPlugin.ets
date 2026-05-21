@@ -1377,64 +1377,80 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
           const characteristicId = args['characteristicId'] as string | undefined ?? '';
           const serviceInstanceId = args['serviceInstanceId'] as string | undefined ?? '';
           const characteristicInstanceId = args['characteristicInstanceId']?.toString() ?? '';
+          const characteristic: CharRef = {
+            deviceId,
+            serviceId,
+            serviceInstanceId,
+            characteristicId,
+            characteristicInstanceId,
+          };
           const gatt = this.connectedDevices.get(deviceId);
           if (gatt == null) {
+            this.emitCharValue(characteristic, undefined, 'device not connected');
             result.success(null);
             break;
           }
           try {
             const services = await this.getGattServicesWhenReady(deviceId);
             if (services == null) {
+              this.emitCharValue(characteristic, undefined, 'GATT services not ready');
               result.success(null);
               break;
             }
             const charFound = this.findCharacteristic(services, serviceId, characteristicId);
-            if (charFound != null) {
-              const callbackKey = this.charChangeCallbackKey(deviceId, serviceId, characteristicId);
-              let newCallbackRegistered = false;
-              let notificationEnabled = false;
-              try {
-                if (!this.charChangeCallbacks.has(callbackKey)) {
-                  const normServiceId = this.normalizeUuid(serviceId);
-                  const normCharId = this.normalizeUuid(characteristicId);
-                  const callback = (ch: ble.BLECharacteristic): void => {
-                    const chServiceId = this.normalizeUuid(this.uuidStr(ch.serviceUuid));
-                    const chCharId = this.normalizeUuid(this.uuidStr(ch.characteristicUuid));
-                    if (chServiceId !== normServiceId || chCharId !== normCharId) {
-                      return;
-                    }
-                    const c: CharRef = {
-                      deviceId,
-                      serviceId: this.uuidStr(ch.serviceUuid),
-                      serviceInstanceId,
-                      characteristicId: this.uuidStr(ch.characteristicUuid),
-                      characteristicInstanceId,
-                    };
-                    const val = this.characteristicValueToNumberArray(ch.characteristicValue);
-                    this.emitCharValue(c, val);
-                  };
-                  gatt.on('BLECharacteristicChange', callback);
-                  this.charChangeCallbacks.set(callbackKey, callback);
-                  newCallbackRegistered = true;
-                }
-                await this.enableCharacteristicNotifications(gatt, charFound);
-                notificationEnabled = true;
-              } catch (e) {
-                if (notificationEnabled) {
-                  try {
-                    await this.disableCharacteristicNotifications(gatt, charFound);
-                  } catch (cleanupErr) {
-                    this.logBleError(`failed to disable notification after readNotifications error for ${deviceId}`,
-                      cleanupErr);
+            if (charFound == null) {
+              this.emitCharValue(characteristic, undefined, 'characteristic not found');
+              result.success(null);
+              break;
+            }
+            const callbackKey = this.charChangeCallbackKey(deviceId, serviceId, characteristicId);
+            let newCallbackRegistered = false;
+            let notificationEnabled = false;
+            try {
+              if (!this.charChangeCallbacks.has(callbackKey)) {
+                const normServiceId = this.normalizeUuid(serviceId);
+                const normCharId = this.normalizeUuid(characteristicId);
+                const callback = (ch: ble.BLECharacteristic): void => {
+                  const chServiceId = this.normalizeUuid(this.uuidStr(ch.serviceUuid));
+                  const chCharId = this.normalizeUuid(this.uuidStr(ch.characteristicUuid));
+                  if (chServiceId !== normServiceId || chCharId !== normCharId) {
+                    return;
                   }
-                }
-                if (newCallbackRegistered) {
-                  this.unregisterCharChangeCallback(deviceId, serviceId, characteristicId, gatt);
-                }
-                this.logBleError(`readNotifications failed for ${deviceId}`, e);
+                  const c: CharRef = {
+                    deviceId,
+                    serviceId: this.uuidStr(ch.serviceUuid),
+                    serviceInstanceId,
+                    characteristicId: this.uuidStr(ch.characteristicUuid),
+                    characteristicInstanceId,
+                  };
+                  const val = this.characteristicValueToNumberArray(ch.characteristicValue);
+                  this.emitCharValue(c, val);
+                };
+                gatt.on('BLECharacteristicChange', callback);
+                this.charChangeCallbacks.set(callbackKey, callback);
+                newCallbackRegistered = true;
               }
+              await this.enableCharacteristicNotifications(gatt, charFound);
+              notificationEnabled = true;
+            } catch (e) {
+              if (notificationEnabled) {
+                try {
+                  await this.disableCharacteristicNotifications(gatt, charFound);
+                } catch (cleanupErr) {
+                  this.logBleError(`failed to disable notification after readNotifications error for ${deviceId}`,
+                    cleanupErr);
+                }
+              }
+              if (newCallbackRegistered) {
+                this.unregisterCharChangeCallback(deviceId, serviceId, characteristicId, gatt);
+              }
+              const errorMsg = (e as BusinessError).message ?? String(e);
+              this.emitCharValue(characteristic, undefined, `Failed to subscribe: ${errorMsg}`);
+              this.logBleError(`readNotifications failed for ${deviceId}`, e);
             }
           } catch (e) {
+            const errorMsg = (e as BusinessError).message ?? String(e);
+            this.emitCharValue(characteristic, undefined, `Failed to subscribe: ${errorMsg}`);
             this.logBleError(`readNotifications failed for ${deviceId}`, e);
           }
           result.success(null);
