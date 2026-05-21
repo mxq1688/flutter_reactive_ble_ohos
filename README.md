@@ -135,12 +135,29 @@ The native layer is built on HarmonyOS NEXT system APIs:
 
 - Duplicate connection requests to the same device are deduplicated
 - Connection timeout is configurable; the timer is properly cleared on success or disconnect
-- GATT service discovery completes before reporting connection success, with a brief delay to ensure characteristic readiness
+- GATT service discovery completes before reporting connection success; readiness is verified by polling `getServices()` until characteristics (and notify/indicate descriptors) are available
 
 ### Scan Optimization
 
-- Device name resolution via temporary `GattClientDevice` is queued (max 3 concurrent) to prevent system overload
-- Scan results are always emitted (including RSSI updates); deduplication only applies to name resolution requests
+- Device names come from advertisement data first (`parseLocalNameFromAdvData`)
+- **By default**, scan does **not** create temporary `GattClientDevice` connections to resolve missing names (avoids occupying connection slots on sensitive peripherals)
+- To enable Gatt-based name resolution during scan, set before scanning:
+
+```dart
+ReactiveBleOhosPlatform.resolveScanDeviceNamesViaGatt = true;
+```
+
+- When enabled, name requests are queued (max 3 concurrent) to prevent system overload
+- Scan results are always emitted (including RSSI updates); deduplication only applies to Gatt name resolution
+
+### Write Characteristic
+
+HarmonyOS `writeCharacteristicValue(characteristic, writeType)` expects a `BLECharacteristic` with `characteristicValue` set (there is no separate data parameter). The plugin builds a **new** characteristic object from the discovered service/UUID plus the write payload, instead of mutating the instance returned by `getServices()`.
+
+### MTU Negotiation
+
+- `requestMtuSize` calls `setBLEMtuSize()` and waits for the HarmonyOS `BLEMtuChange` callback to return the **negotiated** MTU (not the requested value)
+- Requested MTU is clamped to the platform range (23–517). If no callback arrives within 3 seconds, the last known MTU from `BLEMtuChange` is used, or 23 (ATT default) as fallback
 
 ### Unsupported: clearGattCache
 

@@ -10,6 +10,13 @@ import 'ohos_ble_codec.dart';
 /// subscribe/stop notifications, MTU negotiation, connection priority, readRssi.
 /// Does NOT implement [clearGattCache] (no public API on HarmonyOS).
 class ReactiveBleOhosPlatform extends ReactiveBlePlatform {
+  /// 扫描时是否创建临时 GattClient 解析无广播名称的设备。
+  ///
+  /// 默认 `false`：仅使用广播数据中的名称（[parseLocalNameFromAdvData] 等价逻辑），
+  /// 避免临时连接占用设备资源、影响后续正式连接。
+  /// 设为 `true` 可恢复通过 Gatt 拉取名称的行为（并发上限 3）。
+  static bool resolveScanDeviceNamesViaGatt = false;
+
   ReactiveBleOhosPlatform({
     required MethodChannel methodChannel,
     required EventChannel scanChannel,
@@ -92,6 +99,7 @@ class ReactiveBleOhosPlatform extends ReactiveBlePlatform {
       withServices: withServices,
       scanMode: scanMode,
       requireLocationServicesEnabled: requireLocationServicesEnabled,
+      resolveDeviceNamesViaGatt: resolveScanDeviceNamesViaGatt,
     );
     return _methodChannel.invokeMethod<void>('scanForDevices', args).asStream();
   }

@@ -1,3 +1,4 @@
+import 'dart:developer' as developer;
 import 'dart:typed_data';
 
 import 'package:reactive_ble_platform_interface/reactive_ble_platform_interface.dart'
@@ -31,6 +32,28 @@ import 'package:reactive_ble_platform_interface/reactive_ble_platform_interface.
 /// JSON-serializable codec for MethodChannel/EventChannel with HarmonyOS native.
 /// Uses Map<String, dynamic> for cross-platform compatibility.
 class OhosBleCodec {
+  static const String _logName = 'flutter_reactive_ble_ohos';
+
+  /// Parses [raw] as UUID; logs and returns null on failure (never returns zero/empty UUID).
+  static Uuid? tryParseUuid(String? raw, {String? context}) {
+    if (raw == null || raw.trim().isEmpty) {
+      developer.log(
+        'skip empty UUID${context != null ? ' ($context)' : ''}',
+        name: _logName,
+      );
+      return null;
+    }
+    try {
+      return Uuid.parse(raw.trim());
+    } catch (e) {
+      developer.log(
+        'invalid UUID "$raw"${context != null ? ' ($context)' : ''}: $e',
+        name: _logName,
+      );
+      return null;
+    }
+  }
+
   static Map<String, dynamic>? _asStringDynamicMap(dynamic raw) {
     if (raw is Map<String, dynamic>) return raw;
     if (raw is Map) {
@@ -45,11 +68,13 @@ class OhosBleCodec {
     required List<Uuid> withServices,
     required ScanMode scanMode,
     required bool requireLocationServicesEnabled,
+    bool resolveDeviceNamesViaGatt = false,
   }) {
     return {
       'withServices': withServices.map((u) => u.toString()).toList(),
       'scanMode': convertScanModeToArgs(scanMode),
       'requireLocationServicesEnabled': requireLocationServicesEnabled,
+      'resolveDeviceNamesViaGatt': resolveDeviceNamesViaGatt,
     };
   }
 
@@ -172,13 +197,14 @@ class OhosBleCodec {
 
   static List<Uuid> _decodeUuidList(dynamic raw) {
     if (raw is! List) return [];
-    return raw.map((e) {
-      try {
-        return Uuid.parse(e.toString());
-      } catch (_) {
-        return Uuid(Uint8List.fromList([]));
+    final out = <Uuid>[];
+    for (final e in raw) {
+      final uuid = tryParseUuid(e.toString(), context: 'scan serviceUuids');
+      if (uuid != null) {
+        out.add(uuid);
       }
-    }).toList();
+    }
+    return out;
   }
 
   static Connectable _decodeConnectable(int? code) {
@@ -228,14 +254,15 @@ class OhosBleCodec {
     if (characteristic == null) {
       return CharacteristicValue(
         characteristic: CharacteristicInstance(
-            characteristicId: Uuid([]),
-            characteristicInstanceId: '',
-            serviceId: Uuid([]),
-            serviceInstanceId: '',
-            deviceId: ''),
+          characteristicId: Uuid.parse('00000000-0000-0000-0000-000000000000'),
+          characteristicInstanceId: '',
+          serviceId: Uuid.parse('00000000-0000-0000-0000-000000000000'),
+          serviceInstanceId: '',
+          deviceId: charMap?['deviceId'] as String? ?? '',
+        ),
         result: Result.failure(GenericFailure<CharacteristicValueUpdateError>(
             code: CharacteristicValueUpdateError.unknown,
-            message: 'Invalid characteristic')),
+            message: 'Invalid characteristic (UUID parse failed)')),
       );
     }
     if (map['error'] != null) {
@@ -253,18 +280,14 @@ class OhosBleCodec {
     );
   }
 
-  static CharacteristicInstance _decodeCharacteristicInstance(
+  static CharacteristicInstance? _decodeCharacteristicInstance(
       Map<String, dynamic> m) {
-    Uuid serviceId;
-    Uuid charId;
-    try {
-      serviceId = Uuid.parse(
-          m['serviceId'] as String? ?? '00000000-0000-1000-8000-00805f9b34fb');
-      charId = Uuid.parse(m['characteristicId'] as String? ??
-          '00000000-0000-1000-8000-00805f9b34fb');
-    } catch (_) {
-      serviceId = Uuid(Uint8List(16));
-      charId = Uuid(Uint8List(16));
+    final serviceId =
+        tryParseUuid(m['serviceId'] as String?, context: 'characteristic serviceId');
+    final charId = tryParseUuid(
+        m['characteristicId'] as String?, context: 'characteristicId');
+    if (serviceId == null || charId == null) {
+      return null;
     }
     return CharacteristicInstance(
       deviceId: m['deviceId'] as String? ?? '',
@@ -276,36 +299,47 @@ class OhosBleCodec {
   }
 
   static List<DiscoveredService> decodeDiscoveredServices(List<dynamic> raw) {
-    return raw
-        .map(_asStringDynamicMap)
-        .whereType<Map<String, dynamic>>()
-        .map(_decodeDiscoveredService)
-        .toList();
+    final out = <DiscoveredService>[];
+    for (final item in raw) {
+      final m = _asStringDynamicMap(item);
+      if (m == null) continue;
+      final service = _decodeDiscoveredService(m);
+      if (service != null) {
+        out.add(service);
+      }
+    }
+    return out;
   }
 
-  static DiscoveredService _decodeDiscoveredService(Map<String, dynamic> m) {
-    Uuid serviceId;
-    try {
-      serviceId = Uuid.parse(
-          m['serviceId'] as String? ?? '00000000-0000-1000-8000-00805f9b34fb');
-    } catch (_) {
-      serviceId = Uuid(Uint8List(16));
+  static DiscoveredService? _decodeDiscoveredService(Map<String, dynamic> m) {
+    final serviceId =
+        tryParseUuid(m['serviceId'] as String?, context: 'discovered serviceId');
+    if (serviceId == null) {
+      return null;
     }
     final serviceInstanceId = m['serviceInstanceId'] as String? ?? '';
     final chars = (m['characteristics'] as List<dynamic>?) ?? [];
-    final characteristics = chars
-        .map(_asStringDynamicMap)
-        .whereType<Map<String, dynamic>>()
-        .map((c) => _decodeDiscoveredCharacteristic(c, serviceId))
-        .toList();
+    final characteristics = <DiscoveredCharacteristic>[];
+    for (final item in chars) {
+      final cMap = _asStringDynamicMap(item);
+      if (cMap == null) continue;
+      final c = _decodeDiscoveredCharacteristic(cMap, serviceId);
+      if (c != null) {
+        characteristics.add(c);
+      }
+    }
     final characteristicIds =
         characteristics.map((c) => c.characteristicId).toList();
-    final included = (m['includedServices'] as List<dynamic>?)
-            ?.map(_asStringDynamicMap)
-            .whereType<Map<String, dynamic>>()
-            .map(_decodeDiscoveredService)
-            .toList() ??
-        [];
+    final included = <DiscoveredService>[];
+    final includedRaw = (m['includedServices'] as List<dynamic>?) ?? [];
+    for (final item in includedRaw) {
+      final incMap = _asStringDynamicMap(item);
+      if (incMap == null) continue;
+      final inc = _decodeDiscoveredService(incMap);
+      if (inc != null) {
+        included.add(inc);
+      }
+    }
     return DiscoveredService(
       serviceId: serviceId,
       serviceInstanceId: serviceInstanceId,
@@ -315,14 +349,12 @@ class OhosBleCodec {
     );
   }
 
-  static DiscoveredCharacteristic _decodeDiscoveredCharacteristic(
+  static DiscoveredCharacteristic? _decodeDiscoveredCharacteristic(
       Map<String, dynamic> m, Uuid serviceId) {
-    Uuid charId;
-    try {
-      charId = Uuid.parse(m['characteristicId'] as String? ??
-          '00000000-0000-1000-8000-00805f9b34fb');
-    } catch (_) {
-      charId = Uuid(Uint8List(16));
+    final charId = tryParseUuid(
+        m['characteristicId'] as String?, context: 'discovered characteristicId');
+    if (charId == null) {
+      return null;
     }
     return DiscoveredCharacteristic(
       characteristicId: charId,
@@ -345,13 +377,15 @@ class OhosBleCodec {
     if (characteristic == null) {
       return WriteCharacteristicInfo(
         characteristic: CharacteristicInstance(
-            characteristicId: Uuid([]),
-            characteristicInstanceId: '',
-            serviceId: Uuid([]),
-            serviceInstanceId: '',
-            deviceId: ''),
+          characteristicId: Uuid.parse('00000000-0000-0000-0000-000000000000'),
+          characteristicInstanceId: '',
+          serviceId: Uuid.parse('00000000-0000-0000-0000-000000000000'),
+          serviceInstanceId: '',
+          deviceId: charMap?['deviceId'] as String? ?? '',
+        ),
         result: Result.failure(GenericFailure<WriteCharacteristicFailure>(
-            code: WriteCharacteristicFailure.unknown, message: 'Invalid')),
+            code: WriteCharacteristicFailure.unknown,
+            message: 'Invalid characteristic (UUID parse failed)')),
       );
     }
     final error = map['error'] as String?;

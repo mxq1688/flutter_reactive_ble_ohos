@@ -291,6 +291,68 @@ void main() {
         final result = OhosBleCodec.decodeDiscoveredServices([]);
         expect(result, isEmpty);
       });
+
+      test('skips entries with invalid UUIDs', () {
+        final result = OhosBleCodec.decodeDiscoveredServices([
+          {
+            'serviceId': 'not-a-valid-uuid',
+            'serviceInstanceId': '0',
+            'characteristics': [],
+            'includedServices': [],
+          },
+          {
+            'serviceId': '0000180d-0000-1000-8000-00805f9b34fb',
+            'serviceInstanceId': '1',
+            'characteristics': [
+              {
+                'characteristicId': 'also-invalid',
+                'characteristicInstanceId': '0',
+                'isReadable': true,
+                'isWritableWithResponse': false,
+                'isWritableWithoutResponse': false,
+                'isNotifiable': false,
+                'isIndicatable': false,
+              },
+              {
+                'characteristicId': '00002a37-0000-1000-8000-00805f9b34fb',
+                'characteristicInstanceId': '1',
+                'isReadable': true,
+                'isWritableWithResponse': false,
+                'isWritableWithoutResponse': false,
+                'isNotifiable': true,
+                'isIndicatable': false,
+              },
+            ],
+            'includedServices': [],
+          },
+        ]);
+        expect(result.length, 1);
+        expect(result[0].characteristics.length, 1);
+        expect(
+          result[0].characteristics[0].characteristicId.toString(),
+          '00002a37-0000-1000-8000-00805f9b34fb',
+        );
+      });
+
+      test('decodeUuidList omits invalid scan service UUIDs', () {
+        final result = OhosBleCodec.decodeScanResult({
+          'device': {
+            'id': 'AA:BB:CC:DD:EE:FF',
+            'name': 'test',
+            'rssi': -50,
+            'serviceUuids': ['0000180d-0000-1000-8000-00805f9b34fb', 'garbage'],
+            'serviceData': {},
+            'manufacturerData': [],
+            'connectable': 2,
+          },
+        });
+        result.result.iif(
+          success: (device) {
+            expect(device.serviceUuids.length, 1);
+          },
+          failure: (_) => fail('Expected success'),
+        );
+      });
     });
 
     group('encode methods', () {
@@ -304,6 +366,17 @@ void main() {
         expect(result.containsKey('scanMode'), true);
         expect(result.containsKey('requireLocationServicesEnabled'), true);
         expect(result['requireLocationServicesEnabled'], false);
+        expect(result['resolveDeviceNamesViaGatt'], false);
+      });
+
+      test('encodeScanRequest can enable Gatt name resolution', () {
+        final result = OhosBleCodec.encodeScanRequest(
+          withServices: [],
+          scanMode: ScanMode.lowLatency,
+          requireLocationServicesEnabled: true,
+          resolveDeviceNamesViaGatt: true,
+        );
+        expect(result['resolveDeviceNamesViaGatt'], true);
       });
 
       test('encodeConnectRequest includes deviceId and timeout', () {
