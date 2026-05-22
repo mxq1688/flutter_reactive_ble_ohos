@@ -192,7 +192,27 @@ void main() {
         result.result.iif(
           success: (_) => fail('Expected failure'),
           failure: (error) {
-            expect(error, isNotNull);
+            expect(error!.message, OhosBleCodec.invalidCharacteristicDecodeMessage);
+          },
+        );
+      });
+
+      test('fails with placeholder UUID when characteristic UUIDs are invalid', () {
+        final result = OhosBleCodec.decodeWriteCharacteristicInfo({
+          'characteristic': {
+            'deviceId': 'test-device',
+            'serviceId': 'bad',
+            'characteristicId': 'bad',
+          },
+        });
+        expect(
+          result.characteristic.serviceId,
+          OhosBleCodec.invalidCharacteristicPlaceholderUuid,
+        );
+        result.result.iif(
+          success: (_) => fail('Expected failure'),
+          failure: (error) {
+            expect(error!.message, OhosBleCodec.invalidCharacteristicDecodeMessage);
           },
         );
       });
@@ -256,6 +276,27 @@ void main() {
           success: (_) => fail('Expected failure'),
           failure: (error) {
             expect(error!.message, 'Read failed');
+          },
+        );
+      });
+
+      test('fails with placeholder UUID when characteristic UUIDs are invalid', () {
+        final result = OhosBleCodec.decodeCharacteristicValue({
+          'characteristic': {
+            'deviceId': 'AA:BB:CC:DD:EE:FF',
+            'serviceId': 'not-a-uuid',
+            'characteristicId': 'also-invalid',
+          },
+        });
+        expect(
+          result.characteristic.characteristicId,
+          OhosBleCodec.invalidCharacteristicPlaceholderUuid,
+        );
+        expect(result.characteristic.deviceId, 'AA:BB:CC:DD:EE:FF');
+        result.result.iif(
+          success: (_) => fail('Expected failure'),
+          failure: (error) {
+            expect(error!.message, OhosBleCodec.invalidCharacteristicDecodeMessage);
           },
         );
       });

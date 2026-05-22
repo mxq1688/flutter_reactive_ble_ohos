@@ -62,6 +62,29 @@ class OhosBleCodec {
     return null;
   }
 
+  /// Placeholder UUID when native characteristic JSON cannot be decoded.
+  ///
+  /// Not a real GATT service/characteristic — callers must check
+  /// [CharacteristicValue.result] or [WriteCharacteristicInfo.result] before
+  /// using [CharacteristicInstance] for read/write/subscribe.
+  static final Uuid invalidCharacteristicPlaceholderUuid =
+      Uuid.parse('00000000-0000-0000-0000-000000000000');
+
+  static const String invalidCharacteristicDecodeMessage =
+      'Invalid characteristic (UUID parse failed); placeholder UUID must not be used for GATT — check result';
+
+  static CharacteristicInstance characteristicDecodeFailurePlaceholder({
+    String deviceId = '',
+  }) {
+    return CharacteristicInstance(
+      characteristicId: invalidCharacteristicPlaceholderUuid,
+      characteristicInstanceId: '',
+      serviceId: invalidCharacteristicPlaceholderUuid,
+      serviceInstanceId: '',
+      deviceId: deviceId,
+    );
+  }
+
   // ---- Encode (Dart -> Native) ----
 
   static Map<String, dynamic> encodeScanRequest({
@@ -246,6 +269,11 @@ class OhosBleCodec {
     }
   }
 
+  /// Decodes a characteristic value update from native.
+  ///
+  /// On UUID parse failure, [result] is failure and [characteristic] uses
+  /// [invalidCharacteristicPlaceholderUuid] only to satisfy the non-nullable API —
+  /// do not perform GATT operations on that placeholder.
   static CharacteristicValue decodeCharacteristicValue(
       Map<String, dynamic> map) {
     final charMap = _asStringDynamicMap(map['characteristic']);
@@ -253,16 +281,12 @@ class OhosBleCodec {
         charMap != null ? _decodeCharacteristicInstance(charMap) : null;
     if (characteristic == null) {
       return CharacteristicValue(
-        characteristic: CharacteristicInstance(
-          characteristicId: Uuid.parse('00000000-0000-0000-0000-000000000000'),
-          characteristicInstanceId: '',
-          serviceId: Uuid.parse('00000000-0000-0000-0000-000000000000'),
-          serviceInstanceId: '',
+        characteristic: characteristicDecodeFailurePlaceholder(
           deviceId: charMap?['deviceId'] as String? ?? '',
         ),
         result: Result.failure(GenericFailure<CharacteristicValueUpdateError>(
             code: CharacteristicValueUpdateError.unknown,
-            message: 'Invalid characteristic (UUID parse failed)')),
+            message: invalidCharacteristicDecodeMessage)),
       );
     }
     if (map['error'] != null) {
@@ -369,6 +393,9 @@ class OhosBleCodec {
     );
   }
 
+  /// Decodes a write-characteristic result from native.
+  ///
+  /// On UUID parse failure, see [decodeCharacteristicValue] for placeholder behavior.
   static WriteCharacteristicInfo decodeWriteCharacteristicInfo(
       Map<String, dynamic> map) {
     final charMap = _asStringDynamicMap(map['characteristic']);
@@ -376,16 +403,12 @@ class OhosBleCodec {
         charMap != null ? _decodeCharacteristicInstance(charMap) : null;
     if (characteristic == null) {
       return WriteCharacteristicInfo(
-        characteristic: CharacteristicInstance(
-          characteristicId: Uuid.parse('00000000-0000-0000-0000-000000000000'),
-          characteristicInstanceId: '',
-          serviceId: Uuid.parse('00000000-0000-0000-0000-000000000000'),
-          serviceInstanceId: '',
+        characteristic: characteristicDecodeFailurePlaceholder(
           deviceId: charMap?['deviceId'] as String? ?? '',
         ),
         result: Result.failure(GenericFailure<WriteCharacteristicFailure>(
             code: WriteCharacteristicFailure.unknown,
-            message: 'Invalid characteristic (UUID parse failed)')),
+            message: invalidCharacteristicDecodeMessage)),
       );
     }
     final error = map['error'] as String?;

@@ -190,6 +190,8 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
   private discoveredDeviceIds: Set<string> = new Set(); // 已发现的设备 ID（用于去重）
   /** FIFO 顺序，用于在长时间扫描时按最早发现批次淘汰缓存 */
   private discoveredDeviceIdOrder: string[] = [];
+  /** 各设备最近一次广播解析结果，供 Gatt 名称解析后合并上报 */
+  private lastScanPayloadByDevice: Map<string, ScanDevicePayload> = new Map();
 
   onAttachedToEngine(binding: FlutterPluginBinding): void {
     this.binding = binding;
@@ -428,6 +430,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     this.discoveredDeviceIdOrder = [];
     this.completedNameRequests.clear();
     this.nameRequestQueue = [];
+    this.lastScanPayloadByDevice.clear();
   }
 
   private trimScanDiscoveryCacheIfNeeded(): void {
@@ -440,10 +443,39 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
       const id = removed[i];
       this.discoveredDeviceIds.delete(id);
       this.completedNameRequests.delete(id);
+      this.lastScanPayloadByDevice.delete(id);
     }
     this.nameRequestQueue = this.nameRequestQueue.filter(
       (id: string) => this.discoveredDeviceIds.has(id) || this.pendingNameRequests.has(id)
     );
+  }
+
+  private cacheLastScanPayload(device: ScanDevicePayload): void {
+    this.lastScanPayloadByDevice.set(device.id, device);
+  }
+
+  private buildScanPayloadWithResolvedName(deviceId: string, name: string): ScanDevicePayload {
+    const cached = this.lastScanPayloadByDevice.get(deviceId);
+    if (cached != null) {
+      return {
+        id: deviceId,
+        name,
+        rssi: cached.rssi,
+        serviceUuids: cached.serviceUuids,
+        serviceData: cached.serviceData,
+        manufacturerData: cached.manufacturerData,
+        connectable: cached.connectable,
+      };
+    }
+    return {
+      id: deviceId,
+      name,
+      rssi: 0,
+      serviceUuids: [],
+      serviceData: {},
+      manufacturerData: [],
+      connectable: CONNECTABLE_UNKNOWN,
+    };
   }
 
   /** 记录已发现设备；若为新设备返回 true，已存在则返回 false */
@@ -525,15 +557,8 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     }
     try {
       if (name != null && name.length > 0 && this.isScanning) {
-        const updated: ScanDevicePayload = {
-          id: deviceId,
-          name,
-          rssi: 0,
-          serviceUuids: [],
-          serviceData: {},
-          manufacturerData: [],
-          connectable: CONNECTABLE_UNKNOWN,
-        };
+        const updated = this.buildScanPayloadWithResolvedName(deviceId, name);
+        this.cacheLastScanPayload(updated);
         this.emitScanResult(updated);
       }
     } catch (e) {
@@ -568,6 +593,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
       manufacturerData,
       connectable,
     };
+    this.cacheLastScanPayload(device);
     this.emitScanResult(device);
 
     // 广播名优先；仅当启用 resolveScanNamesViaGatt 且名称为空时才创建临时 GattClient
