@@ -4,7 +4,7 @@
  * 基于 @kit.ConnectivityKit (ble) 与 @ohos.bluetooth.access 实现。
  * 参考文档：https://developer.huawei.com/consumer/cn/doc/harmonyos-references/js-apis-bluetooth-ble
  *
- * 实现除 clearGattCache 外的全部能力，与 Dart 层通过以下 Channel 通信：
+ * 实现除 clearGattCache、requestConnectionPriority 外的全部能力，与 Dart 层通过以下 Channel 通信：
  * - MethodChannel: reactive_ble_ohos_method
  * - EventChannel: reactive_ble_ohos_scan, reactive_ble_ohos_connected_device,
  *   reactive_ble_ohos_char_update, reactive_ble_ohos_status
@@ -75,9 +75,6 @@ interface RssiResultPayload {
 }
 interface ConnStateWithCode {
   code?: number;
-}
-interface GattWithPriority {
-  requestConnectionPriority(priority: number): void;
 }
 interface MtuNegotiationPending {
   settled: boolean;
@@ -395,6 +392,8 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
   }
 
   private stopScan(): void {
+    const queuedCount = this.nameRequestQueue.length;
+    const pendingCount = this.pendingNameRequests.size;
     try {
       ble.stopBLEScan();
       if (this.scanResultHandler != null) {
@@ -409,6 +408,11 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     }
     this.isScanning = false;
     this.cleanupPendingNameRequests();
+    if (queuedCount > 0 || pendingCount > 0) {
+      console.info(
+        `ReactiveBleOhos: stopScan cleared name resolution (queued=${queuedCount}, pending=${pendingCount})`
+      );
+    }
   }
 
   private closeTemporaryGattClient(deviceId: string, client: ble.GattClientDevice): void {
@@ -459,18 +463,21 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     });
     this.activeGattClients.clear();
     this.pendingNameRequests.clear();
+    this.nameRequestQueue = [];
     this.clearScanDiscoveryCache();
   }
 
   private processNameRequestQueue(): void {
     while (
       this.nameRequestQueue.length > 0 &&
-      this.pendingNameRequests.size < ReactiveBleOhosPlugin.MAX_CONCURRENT_NAME_REQUESTS &&
-      this.isScanning
+      this.pendingNameRequests.size < ReactiveBleOhosPlugin.MAX_CONCURRENT_NAME_REQUESTS
     ) {
       const deviceId = this.nameRequestQueue.shift();
       if (!deviceId) break;
       if (this.pendingNameRequests.has(deviceId) || this.completedNameRequests.has(deviceId)) {
+        continue;
+      }
+      if (!this.isScanning) {
         continue;
       }
       this.executeNameRequest(deviceId);
@@ -1033,7 +1040,10 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     return uuids;
   }
 
-  /** 从广播数据中解析厂商数据（仅 AD type 0xFF 的 payload，与 Dart readExtendInfo 一致） */
+  /**
+   * 从广播数据中解析厂商数据（所有 AD type 0xFF 的 payload 按出现顺序拼接）。
+   * 每条 0xFF 结构含 companyId(2B) + 厂商自定义数据，与 Dart DiscoveredDevice.manufacturerData 扁平数组一致。
+   */
   private parseManufacturerData(data: ArrayBuffer): number[] {
     const arr: number[] = [];
     const view = new DataView(data);
@@ -1046,7 +1056,6 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
         for (let i = 0; i < len - 1; i++) {
           arr.push(view.getUint8(offset + 2 + i));
         }
-        break;
       }
       offset += 1 + len;
     }
@@ -1104,8 +1113,6 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
           this.resolveScanNamesViaGatt = (args['resolveDeviceNamesViaGatt'] as boolean) ?? false;
 
           this.stopScan();
-          this.pendingNameRequests.clear();
-          this.clearScanDiscoveryCache();
 
           const filterArray: ble.ScanFilter[] = [];
           for (let i = 0; i < withServices.length; i++) {
@@ -1201,6 +1208,9 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
             if (timeoutInMs > 0) {
               const timeoutId = setTimeout(() => {
                 this.connectTimeoutId = -1;
+                if (this.connectedDevices.has(deviceId)) {
+                  return;
+                }
                 this.abortPendingConnect(deviceId, sessionId, client, 'Connection timeout');
               }, timeoutInMs);
               this.connectTimeoutId = timeoutId as number;
@@ -1498,19 +1508,10 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
         }
 
         case 'requestConnectionPriority': {
-          const deviceId = args['deviceId'] as string | undefined ?? '';
-          const priority = (args['priority'] as number) ?? 0;
-          try {
-            const gatt = this.connectedDevices.get(deviceId);
-            if (gatt != null) {
-              const gattPriority = gatt as Object as GattWithPriority;
-              gattPriority.requestConnectionPriority(priority);
-            }
-          } catch (e) {
-            this.logBleError(`requestConnectionPriority failed for ${deviceId}`, e);
-          }
-          const emptyPayload: Record<string, number> = {};
-          result.success(emptyPayload);
+          const errPayload: Record<string, string> = {
+            error: 'requestConnectionPriority is not supported on HarmonyOS',
+          };
+          result.success(errPayload);
           break;
         }
 

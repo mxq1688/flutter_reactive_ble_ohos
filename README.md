@@ -163,6 +163,10 @@ HarmonyOS `writeCharacteristicValue(characteristic, writeType)` expects a `BLECh
 
 HarmonyOS does not expose a public API for clearing the GATT cache (unlike Android's hidden `BluetoothGatt.refresh()`). Calling `clearGattCache()` will return a `GenericFailure<ClearGattCacheError>`.
 
+### Unsupported: requestConnectionPriority
+
+HarmonyOS `GattClientDevice` does not expose connection-priority adjustment (unlike Android's `BluetoothGatt.requestConnectionPriority()`). Calling `requestConnectionPriority()` will return a `GenericFailure<ConnectionPriorityFailure>`.
+
 ## Requirements
 
 - Flutter SDK `>=2.0.0`

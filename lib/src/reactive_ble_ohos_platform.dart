@@ -7,8 +7,8 @@ import 'ohos_ble_codec.dart';
 ///
 /// Implements: initialize, deinitialize, BLE status, scan, connect, disconnect,
 /// discoverServices, read/write characteristic (with/without response),
-/// subscribe/stop notifications, MTU negotiation, connection priority, readRssi.
-/// Does NOT implement [clearGattCache] (no public API on HarmonyOS).
+/// subscribe/stop notifications, MTU negotiation, readRssi.
+/// Does NOT implement [clearGattCache] or [requestConnectionPriority] (no public API on HarmonyOS).
 class ReactiveBleOhosPlatform extends ReactiveBlePlatform {
   /// 扫描时是否创建临时 GattClient 解析无广播名称的设备。
   ///
@@ -212,11 +212,12 @@ class ReactiveBleOhosPlatform extends ReactiveBlePlatform {
 
   @override
   Future<ConnectionPriorityInfo> requestConnectionPriority(String deviceId, ConnectionPriority priority) async {
-    _logger?.log('ReactiveBleOhos: requestConnectionPriority $deviceId $priority');
-    final args = OhosBleCodec.encodeConnectionPriorityRequest(deviceId, priority);
-    final result = await _methodChannel.invokeMethod<Map<Object?, Object?>>('requestConnectionPriority', args);
-    final map = result != null ? Map<String, dynamic>.from(result) : <String, dynamic>{};
-    return OhosBleCodec.decodeConnectionPriorityInfo(map);
+    return ConnectionPriorityInfo(
+      result: Result.failure(GenericFailure<ConnectionPriorityFailure>(
+        code: ConnectionPriorityFailure.unknown,
+        message: 'requestConnectionPriority is not supported on HarmonyOS',
+      )),
+    );
   }
 }
 
