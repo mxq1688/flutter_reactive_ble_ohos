@@ -62,16 +62,21 @@ class OhosBleCodec {
     return null;
   }
 
-  /// Placeholder UUID when native characteristic JSON cannot be decoded.
+  /// Sentinel UUID when native characteristic JSON cannot be decoded.
   ///
-  /// Not a real GATT service/characteristic — callers must check
-  /// [CharacteristicValue.result] or [WriteCharacteristicInfo.result] before
-  /// using [CharacteristicInstance] for read/write/subscribe.
+  /// Uses all-ones pattern (not the nil UUID) so it is unlikely to collide with
+  /// real or vendor-specific GATT UUIDs. Never use for read/write/subscribe —
+  /// always check [CharacteristicValue.result] or [WriteCharacteristicInfo.result].
   static final Uuid invalidCharacteristicPlaceholderUuid =
-      Uuid.parse('00000000-0000-0000-0000-000000000000');
+      Uuid.parse('ffffffff-ffff-ffff-ffff-ffffffffffff');
 
   static const String invalidCharacteristicDecodeMessage =
-      'Invalid characteristic (UUID parse failed); placeholder UUID must not be used for GATT — check result';
+      'Invalid characteristic (UUID parse failed); sentinel ffff… UUID must not be used for GATT — check result';
+
+  /// Returns true when [uuid] is the decode-failure sentinel from [OhosBleCodec].
+  static bool isPlaceholderUuid(Uuid uuid) {
+    return uuid == invalidCharacteristicPlaceholderUuid;
+  }
 
   static CharacteristicInstance characteristicDecodeFailurePlaceholder({
     String deviceId = '',
@@ -209,11 +214,20 @@ class OhosBleCodec {
     if (raw is! Map) return {};
     final out = <Uuid, Uint8List>{};
     for (final e in raw.entries) {
+      final key = e.key.toString();
       try {
-        final u = Uuid.parse(e.key.toString());
+        final u = tryParseUuid(key, context: 'scan serviceData key');
+        if (u == null) {
+          continue;
+        }
         final list = (e.value as List<dynamic>?)?.cast<int>() ?? [];
         out[u] = Uint8List.fromList(list);
-      } catch (_) {}
+      } catch (exception) {
+        developer.log(
+          'skip invalid serviceData entry: key=$key, error=$exception',
+          name: _logName,
+        );
+      }
     }
     return out;
   }

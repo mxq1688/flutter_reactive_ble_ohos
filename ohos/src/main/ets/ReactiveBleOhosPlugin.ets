@@ -183,6 +183,8 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
   private connectStateHandlerByDevice: Map<string, (state: ble.BLEConnectionChangeState) => void> = new Map();
   /** 各设备最近一次连接状态，用于 EventSink 发送失败或重新监听后补发 */
   private lastConnectionStateByDevice: Map<string, ConnectionPayload> = new Map();
+  /** access 蓝牙适配器 stateChange 回调引用，与 off 成对注销 */
+  private accessStateChangeHandler: ((state: number) => void) | null = null;
 
   // GattClient 创建优化：防止批量创建导致系统崩溃
   private isScanning: boolean = false;
@@ -240,12 +242,16 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     ));
 
     // 监听蓝牙适配器状态变化（参考 js-apis-bluetooth-ble 与 bluetooth.access）
-    try {
-      access.on('stateChange', (state: number) => {
+    if (this.accessStateChangeHandler == null) {
+      this.accessStateChangeHandler = (_state: number): void => {
         this.emitBleStatus();
-      });
-    } catch (e) {
-      this.logBleError('failed to register access stateChange listener', e);
+      };
+      try {
+        access.on('stateChange', this.accessStateChangeHandler);
+      } catch (e) {
+        this.accessStateChangeHandler = null;
+        this.logBleError('failed to register access stateChange listener', e);
+      }
     }
   }
 
@@ -259,10 +265,13 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
   /** 释放扫描、连接、MTU 协商、名称解析等 BLE 资源；可重复调用。 */
   private disposeBleResources(): void {
     this.clearAllConnectTimeouts();
-    try {
-      access.off('stateChange');
-    } catch (e) {
-      this.logBleError('failed to unregister access stateChange listener', e);
+    if (this.accessStateChangeHandler != null) {
+      try {
+        access.off('stateChange', this.accessStateChangeHandler);
+      } catch (e) {
+        this.logBleError('failed to unregister access stateChange listener', e);
+      }
+      this.accessStateChangeHandler = null;
     }
     this.stopScan();
     this.disconnectAll();
@@ -497,12 +506,6 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
         this.logBleError('failed to unregister BLEDeviceFind handler', e);
       }
       this.scanResultHandler = null;
-    } else {
-      try {
-        ble.off('BLEDeviceFind');
-      } catch (e) {
-        this.logBleError('failed to unregister BLEDeviceFind (no handler ref)', e);
-      }
     }
 
     if (this.isScanning) {

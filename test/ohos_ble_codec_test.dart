@@ -127,6 +127,34 @@ void main() {
         );
       });
 
+      test('skips invalid serviceData entries and keeps valid ones', () {
+        final result = OhosBleCodec.decodeScanResult({
+          'device': {
+            'id': 'AA:BB:CC:DD:EE:FF',
+            'name': 'Test',
+            'rssi': -50,
+            'serviceUuids': [],
+            'serviceData': {
+              'not-a-uuid': [1, 2],
+              '0000180d-0000-1000-8000-00805f9b34fb': [0x10, 0x20],
+            },
+            'manufacturerData': [],
+            'connectable': 2,
+          },
+        });
+        result.result.iif(
+          success: (device) {
+            expect(device.serviceData.length, 1);
+            expect(
+              device.serviceData.keys.first.toString(),
+              '0000180d-0000-1000-8000-00805f9b34fb',
+            );
+            expect(device.serviceData.values.first, Uint8List.fromList([0x10, 0x20]));
+          },
+          failure: (_) => fail('Expected success'),
+        );
+      });
+
       test('decodes scan error', () {
         final result = OhosBleCodec.decodeScanResult({
           'error': 'Scan failed',
@@ -209,11 +237,36 @@ void main() {
           result.characteristic.serviceId,
           OhosBleCodec.invalidCharacteristicPlaceholderUuid,
         );
+        expect(
+          OhosBleCodec.isPlaceholderUuid(result.characteristic.serviceId),
+          isTrue,
+        );
         result.result.iif(
           success: (_) => fail('Expected failure'),
           failure: (error) {
             expect(error!.message, OhosBleCodec.invalidCharacteristicDecodeMessage);
           },
+        );
+      });
+
+      test('isPlaceholderUuid distinguishes sentinel from real UUIDs', () {
+        expect(
+          OhosBleCodec.isPlaceholderUuid(
+            OhosBleCodec.invalidCharacteristicPlaceholderUuid,
+          ),
+          isTrue,
+        );
+        expect(
+          OhosBleCodec.isPlaceholderUuid(
+            Uuid.parse('0000180d-0000-1000-8000-00805f9b34fb'),
+          ),
+          isFalse,
+        );
+        expect(
+          OhosBleCodec.isPlaceholderUuid(
+            Uuid.parse('00000000-0000-0000-0000-000000000000'),
+          ),
+          isFalse,
         );
       });
     });
