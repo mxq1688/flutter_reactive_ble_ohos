@@ -174,8 +174,8 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
   /** 正在连接的设备，用于连接超时与状态回调 */
   private connectingDeviceId: string | null = null;
   private connectingClient: ble.GattClientDevice | null = null;
-  /** 连接超时定时器 ID，用于在连接成功/失败时清除 */
-  private connectTimeoutId: number = -1;
+  /** 各设备连接超时定时器 ID（支持多设备并发连接） */
+  private connectTimeoutIdByDevice: Map<string, number> = new Map();
   /** 每次 connectToDevice 递增，用于超时与状态回调互斥 */
   private connectSessionCounter: number = 0;
   private static readonly MAX_CONNECT_SESSION_ID = 2147483647;
@@ -258,7 +258,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
 
   /** 释放扫描、连接、MTU 协商、名称解析等 BLE 资源；可重复调用。 */
   private disposeBleResources(): void {
-    this.clearConnectTimeout();
+    this.clearAllConnectTimeouts();
     try {
       access.off('stateChange');
     } catch (e) {
@@ -743,11 +743,21 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     }
   }
 
-  private clearConnectTimeout(): void {
-    if (this.connectTimeoutId >= 0) {
-      clearTimeout(this.connectTimeoutId);
-      this.connectTimeoutId = -1;
+  private clearConnectTimeoutForDevice(deviceId: string): void {
+    const timeoutId = this.connectTimeoutIdByDevice.get(deviceId);
+    if (timeoutId !== undefined && timeoutId >= 0) {
+      clearTimeout(timeoutId);
     }
+    this.connectTimeoutIdByDevice.delete(deviceId);
+  }
+
+  private clearAllConnectTimeouts(): void {
+    this.connectTimeoutIdByDevice.forEach((timeoutId: number) => {
+      if (timeoutId >= 0) {
+        clearTimeout(timeoutId);
+      }
+    });
+    this.connectTimeoutIdByDevice.clear();
   }
 
   private isActiveConnectSession(deviceId: string, sessionId: number): boolean {
@@ -810,7 +820,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
       return;
     }
     this.connectSessionByDevice.delete(deviceId);
-    this.clearConnectTimeout();
+    this.clearConnectTimeoutForDevice(deviceId);
     if (this.connectingDeviceId === deviceId) {
       this.connectingDeviceId = null;
       this.connectingClient = null;
@@ -829,7 +839,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
   /** 关闭并注销进行中的连接，使旧 session 回调失效；不发送 DISCONNECTED（用于被新连接取代） */
   private cancelPendingConnectClient(deviceId: string, client: ble.GattClientDevice): void {
     this.connectSessionByDevice.delete(deviceId);
-    this.clearConnectTimeout();
+    this.clearConnectTimeoutForDevice(deviceId);
     this.unregisterMtuChangeCache(deviceId, client);
     this.unregisterConnectStateHandler(deviceId, client);
     try {
@@ -1133,7 +1143,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
 
   private disconnectAll(): void {
     this.clearGattServicesReady();
-    this.clearConnectTimeout();
+    this.clearAllConnectTimeouts();
     this.connectSessionByDevice.clear();
 
     this.connectedDevices.forEach((gatt: ble.GattClientDevice, deviceId: string) => {
@@ -1408,8 +1418,9 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
             client.connect();
 
             if (timeoutInMs > 0) {
+              this.clearConnectTimeoutForDevice(deviceId);
               const timeoutId = setTimeout(() => {
-                this.connectTimeoutId = -1;
+                this.connectTimeoutIdByDevice.delete(deviceId);
                 if (!this.isActiveConnectSession(deviceId, sessionId)) {
                   return;
                 }
@@ -1418,11 +1429,11 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
                 }
                 this.abortPendingConnect(deviceId, sessionId, client, 'Connection timeout');
               }, timeoutInMs);
-              this.connectTimeoutId = timeoutId as number;
+              this.connectTimeoutIdByDevice.set(deviceId, timeoutId as number);
             }
             result.success(null);
           } catch (e) {
-            this.clearConnectTimeout();
+            this.clearConnectTimeoutForDevice(deviceId);
             this.connectSessionByDevice.delete(deviceId);
             if (client != null) {
               this.unregisterConnectStateHandler(deviceId, client);
@@ -1444,7 +1455,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
         case 'disconnectFromDevice': {
           const deviceId = args['deviceId'] as string | undefined ?? '';
           this.connectSessionByDevice.delete(deviceId);
-          this.clearConnectTimeout();
+          this.clearConnectTimeoutForDevice(deviceId);
           this.clearMtuNegotiationPending(deviceId, 'device disconnected');
           this.cancelNameRequestForDevice(deviceId);
           const gatt = this.connectedDevices.get(deviceId);
@@ -1777,6 +1788,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
   /**
    * 按 HarmonyOS 官方写法构造写入用 BLECharacteristic（不修改 getServices 返回的实例）。
    * API: writeCharacteristicValue(characteristic, writeType) — 数据放在 characteristicValue 字段。
+   * 从 discovered 复制 properties，保持与 GATT 发现结果一致，便于系统校验与调试。
    */
   private buildCharacteristicForWrite(
     discovered: ble.BLECharacteristic,
@@ -1786,6 +1798,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
       serviceUuid: discovered.serviceUuid,
       characteristicUuid: discovered.characteristicUuid,
       characteristicValue: value,
+      properties: discovered.properties,
       descriptors: discovered.descriptors ?? [],
     };
   }

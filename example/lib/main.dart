@@ -84,9 +84,10 @@ class _BleHomePageState extends State<BleHomePage> {
 
   @override
   void dispose() {
+    // Stop native BLE first (scan, connections, EventChannel endOfStream); then cancel Dart subscriptions.
+    unawaited(_platform.deinitialize());
     _statusSub?.cancel();
     _scanSub?.cancel();
-    _platform.deinitialize();
     super.dispose();
   }
 
