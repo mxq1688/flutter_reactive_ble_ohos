@@ -86,6 +86,11 @@ class ReactiveBleOhosPlatform extends ReactiveBlePlatform {
   Future<void> deinitialize() async {
     _logger?.log('ReactiveBleOhos: deinitialize');
     await _methodChannel.invokeMethod<void>('deinitialize');
+    // Native endOfStream closes EventChannels; drop cached streams so next listen re-subscribes.
+    _scanResultStream = null;
+    _connectionUpdateStream = null;
+    _charValueStream = null;
+    _bleStatusStream = null;
   }
 
   @override

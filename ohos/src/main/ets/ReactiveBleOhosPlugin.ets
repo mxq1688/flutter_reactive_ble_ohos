@@ -8,6 +8,12 @@
  * - MethodChannel: reactive_ble_ohos_method
  * - EventChannel: reactive_ble_ohos_scan, reactive_ble_ohos_connected_device,
  *   reactive_ble_ohos_char_update, reactive_ble_ohos_status
+ *
+ * 错误处理约定（刻意分层，非统一 try/catch 包装）：
+ * - 用户操作（连接、GATT 读写、MTU、RSSI、发现服务）：经 MethodChannel result.error 或
+ *   EventChannel 载荷中的 error 字段回传 Dart，由 reactive_ble_platform_interface 转为 Result.failure
+ * - 辅助路径（广播解析、扫描名称解析、清理 close/off）：仅 logBleWarning / logBleError，不中断扫描流
+ * - 资源清理（disconnect、插件 detach）：尽力执行并记录日志，避免二次失败掩盖主错误
  */
 
 import {
@@ -79,6 +85,8 @@ interface ConnStateWithCode {
 interface MtuNegotiationPending {
   settled: boolean;
   clampedMtu: number;
+  /** 与 [mtuNegotiationGenerationByDevice] 对齐，用于忽略被取代或乱序的 BLEMtuChange */
+  generation: number;
   resolve: (mtu: number) => void;
   reject: (reason: Error) => void;
   timeoutId: number;
@@ -160,6 +168,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
   private negotiatedMtuByDevice: Map<string, number> = new Map();
   private mtuChangeHandlerByDevice: Map<string, (mtu: number) => void> = new Map();
   private mtuNegotiationPendingByDevice: Map<string, MtuNegotiationPending> = new Map();
+  private mtuNegotiationGenerationByDevice: Map<string, number> = new Map();
   /** 已注册的 BLECharacteristicChange 回调，key 为 deviceId|serviceId|characteristicId */
   private charChangeCallbacks: Map<string, (ch: ble.BLECharacteristic) => void> = new Map();
   /** 正在连接的设备，用于连接超时与状态回调 */
@@ -183,6 +192,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
   private pendingNameRequests: Set<string> = new Set(); // 正在获取名称的设备
   private completedNameRequests: Set<string> = new Set(); // 已完成名称获取的设备
   private activeGattClients: Map<string, ble.GattClientDevice> = new Map(); // 活跃的临时 GattClient
+  private nameRequestTimeoutIdByDevice: Map<string, number> = new Map();
   private static readonly MAX_CONCURRENT_NAME_REQUESTS = 3; // 最大并发数
   private static readonly MAX_DISCOVERED_DEVICES = 1000;
   private static readonly SCAN_CACHE_TRIM_BATCH = 500;
@@ -193,6 +203,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
   /** 各设备最近一次广播解析结果，供 Gatt 名称解析后合并上报 */
   private lastScanPayloadByDevice: Map<string, ScanDevicePayload> = new Map();
 
+  /** FlutterPlugin 生命周期：引擎附加时注册 Method/Event Channel（HarmonyOS API：onAttachedToEngine）。 */
   onAttachedToEngine(binding: FlutterPluginBinding): void {
     this.binding = binding;
     this.methodChannel = new MethodChannel(binding.getBinaryMessenger(), METHOD_CHANNEL);
@@ -201,7 +212,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     this.scanChannel = new EventChannel(binding.getBinaryMessenger(), EVENT_SCAN);
     this.scanChannel.setStreamHandler(this.createStreamHandler(
       (sink: EventSink) => { this.scanSink = sink; },
-      () => { this.scanSink = null; }
+      () => { this.releaseScanEventSink(); }
     ));
 
     this.connectionChannel = new EventChannel(binding.getBinaryMessenger(), EVENT_CONNECTION);
@@ -210,13 +221,13 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
         this.connectionSink = sink;
         this.flushPendingConnectionUpdates();
       },
-      () => { this.connectionSink = null; }
+      () => { this.releaseConnectionEventSink(); }
     ));
 
     this.charUpdateChannel = new EventChannel(binding.getBinaryMessenger(), EVENT_CHAR_UPDATE);
     this.charUpdateChannel.setStreamHandler(this.createStreamHandler(
       (sink: EventSink) => { this.charUpdateSink = sink; },
-      () => { this.charUpdateSink = null; }
+      () => { this.releaseCharUpdateEventSink(); }
     ));
 
     this.bleStatusChannel = new EventChannel(binding.getBinaryMessenger(), EVENT_BLE_STATUS);
@@ -225,7 +236,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
         this.bleStatusSink = sink;
         this.emitBleStatus();
       },
-      () => { this.bleStatusSink = null; }
+      () => { this.releaseBleStatusEventSink(); }
     ));
 
     // 监听蓝牙适配器状态变化（参考 js-apis-bluetooth-ble 与 bluetooth.access）
@@ -238,31 +249,100 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     }
   }
 
+  /** FlutterPlugin 生命周期：引擎销毁时释放 BLE、定时器与 Channel（HarmonyOS API：onDetachedFromEngine）。 */
   onDetachedFromEngine(_binding: FlutterPluginBinding): void {
+    this.disposeBleResources();
+    this.teardownFlutterChannels();
+    this.binding = null;
+  }
+
+  /** 释放扫描、连接、MTU 协商、名称解析等 BLE 资源；可重复调用。 */
+  private disposeBleResources(): void {
+    this.clearConnectTimeout();
     try {
       access.off('stateChange');
-      ble.off('BLEDeviceFind');
     } catch (e) {
-      this.logBleError('failed to unregister BLE listeners on detach', e);
+      this.logBleError('failed to unregister access stateChange listener', e);
     }
     this.stopScan();
     this.disconnectAll();
+    this.clearAllMtuNegotiationPending();
+    this.lastScanPayloadByDevice.clear();
+    this.resolveScanNamesViaGatt = false;
+  }
+
+  private clearAllMtuNegotiationPending(): void {
+    this.mtuNegotiationPendingByDevice.forEach((pending: MtuNegotiationPending) => {
+      if (!pending.settled && pending.timeoutId >= 0) {
+        clearTimeout(pending.timeoutId);
+      }
+      if (!pending.settled) {
+        pending.settled = true;
+        try {
+          pending.reject(new Error('plugin disposed'));
+        } catch (rejectErr) {
+          this.logBleError('failed to reject pending MTU negotiation', rejectErr as object);
+        }
+      }
+    });
+    this.mtuNegotiationPendingByDevice.clear();
+    this.mtuNegotiationGenerationByDevice.clear();
+  }
+
+  private closeEventSink(sink: EventSink | null): void {
+    if (sink == null) {
+      return;
+    }
+    try {
+      sink.endOfStream();
+    } catch (e) {
+      this.logBleError('failed to end EventSink stream', e);
+    }
+  }
+
+  private releaseScanEventSink(): void {
+    this.closeEventSink(this.scanSink);
+    this.scanSink = null;
+  }
+
+  private releaseConnectionEventSink(): void {
+    this.closeEventSink(this.connectionSink);
+    this.connectionSink = null;
+  }
+
+  private releaseCharUpdateEventSink(): void {
+    this.closeEventSink(this.charUpdateSink);
+    this.charUpdateSink = null;
+  }
+
+  private releaseBleStatusEventSink(): void {
+    this.closeEventSink(this.bleStatusSink);
+    this.bleStatusSink = null;
+  }
+
+  /** 结束全部 EventChannel 流，触发 Dart 侧 Stream.onDone；Channel 仍保留供再次订阅。 */
+  private endAllEventSinks(): void {
+    this.releaseScanEventSink();
+    this.releaseConnectionEventSink();
+    this.releaseCharUpdateEventSink();
+    this.releaseBleStatusEventSink();
+  }
+
+  private teardownFlutterChannels(): void {
+    this.endAllEventSinks();
+
     this.scanChannel?.setStreamHandler(NO_OP_STREAM_HANDLER);
     this.connectionChannel?.setStreamHandler(NO_OP_STREAM_HANDLER);
     this.charUpdateChannel?.setStreamHandler(NO_OP_STREAM_HANDLER);
     this.bleStatusChannel?.setStreamHandler(NO_OP_STREAM_HANDLER);
     this.methodChannel?.setMethodCallHandler(null);
-    this.scanSink = null;
-    this.connectionSink = null;
-    this.charUpdateSink = null;
-    this.bleStatusSink = null;
+
     this.lastConnectionStateByDevice.clear();
     this.methodChannel = null;
     this.scanChannel = null;
     this.connectionChannel = null;
     this.charUpdateChannel = null;
     this.bleStatusChannel = null;
-    this.binding = null;
   }
 
   private createStreamHandler(onListen: (sink: EventSink) => void, onCancel: () => void): StreamHandler {
@@ -292,8 +372,18 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     return out;
   }
 
+  private bleErrorMessage(e: object): string {
+    const err = e as BusinessError;
+    return err.message ?? String(e);
+  }
+
+  /** 非致命路径（如广播解析失败）：记录警告并继续，不向 Dart 上报。 */
+  private logBleWarning(context: string, e: object): void {
+    console.warn(`ReactiveBleOhos: ${context}: ${this.bleErrorMessage(e)}`);
+  }
+
   private logBleError(context: string, e: object): void {
-    console.error(`ReactiveBleOhos: ${context}: ${(e as BusinessError).message ?? String(e)}`);
+    console.error(`ReactiveBleOhos: ${context}: ${this.bleErrorMessage(e)}`);
   }
 
   /**
@@ -394,20 +484,35 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
   }
 
   private stopScan(): void {
+    if (!this.isScanning && this.scanResultHandler == null) {
+      return;
+    }
     const queuedCount = this.nameRequestQueue.length;
     const pendingCount = this.pendingNameRequests.size;
-    try {
-      ble.stopBLEScan();
-      if (this.scanResultHandler != null) {
+
+    if (this.scanResultHandler != null) {
+      try {
         ble.off('BLEDeviceFind', this.scanResultHandler);
-        this.scanResultHandler = null;
-      } else {
-        ble.off('BLEDeviceFind');
+      } catch (e) {
+        this.logBleError('failed to unregister BLEDeviceFind handler', e);
       }
-    } catch (e) {
-      this.logBleError('failed to stop BLE scan', e);
       this.scanResultHandler = null;
+    } else {
+      try {
+        ble.off('BLEDeviceFind');
+      } catch (e) {
+        this.logBleError('failed to unregister BLEDeviceFind (no handler ref)', e);
+      }
     }
+
+    if (this.isScanning) {
+      try {
+        ble.stopBLEScan();
+      } catch (e) {
+        this.logBleError('failed to stop BLE scan', e);
+      }
+    }
+
     this.isScanning = false;
     this.cleanupPendingNameRequests();
     if (queuedCount > 0 || pendingCount > 0) {
@@ -489,7 +594,29 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     return true;
   }
 
+  private clearNameRequestTimeout(deviceId: string): void {
+    const timeoutId = this.nameRequestTimeoutIdByDevice.get(deviceId);
+    if (timeoutId !== undefined && timeoutId >= 0) {
+      clearTimeout(timeoutId);
+    }
+    this.nameRequestTimeoutIdByDevice.delete(deviceId);
+  }
+
+  private cancelNameRequestForDevice(deviceId: string): void {
+    this.clearNameRequestTimeout(deviceId);
+    const client = this.activeGattClients.get(deviceId);
+    if (client != null) {
+      this.closeTemporaryGattClient(deviceId, client);
+      this.activeGattClients.delete(deviceId);
+    }
+    this.pendingNameRequests.delete(deviceId);
+  }
+
   private cleanupPendingNameRequests(): void {
+    this.nameRequestTimeoutIdByDevice.forEach((_timeoutId: number, deviceId: string) => {
+      this.clearNameRequestTimeout(deviceId);
+    });
+    this.nameRequestTimeoutIdByDevice.clear();
     this.activeGattClients.forEach((client: ble.GattClientDevice, deviceId: string) => {
       this.closeTemporaryGattClient(deviceId, client);
     });
@@ -529,16 +656,21 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
       return;
     }
     this.activeGattClients.set(deviceId, tempClient);
+    this.clearNameRequestTimeout(deviceId);
 
     const timeoutId = setTimeout(() => {
+      if (this.activeGattClients.get(deviceId) !== tempClient) {
+        return;
+      }
       this.finalizeNameRequest(deviceId, tempClient, null);
     }, 3000) as number;
+    this.nameRequestTimeoutIdByDevice.set(deviceId, timeoutId);
 
     tempClient.getDeviceName().then((resolvedName: string) => {
-      clearTimeout(timeoutId);
+      this.clearNameRequestTimeout(deviceId);
       this.finalizeNameRequest(deviceId, tempClient, resolvedName);
     }).catch((e: object) => {
-      clearTimeout(timeoutId);
+      this.clearNameRequestTimeout(deviceId);
       this.logBleError(`getDeviceName failed for scan name resolution ${deviceId}`, e);
       this.finalizeNameRequest(deviceId, tempClient, null);
     });
@@ -551,6 +683,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     try {
       this.closeTemporaryGattClient(deviceId, client);
     } finally {
+      this.clearNameRequestTimeout(deviceId);
       this.activeGattClients.delete(deviceId);
       this.pendingNameRequests.delete(deviceId);
       this.completedNameRequests.add(deviceId);
@@ -580,7 +713,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
         if (advName.length > 0) name = advName;
       }
     } catch (parseErr) {
-      this.logBleError(`failed to parse scan advertisement for ${item.deviceId}`, parseErr);
+      this.logBleWarning(`failed to parse scan advertisement for ${item.deviceId}`, parseErr);
     }
     const connectable = item.connectable === true ? CONNECTABLE_AVAILABLE :
       (item.connectable === false ? CONNECTABLE_UNAVAILABLE : CONNECTABLE_UNKNOWN);
@@ -804,6 +937,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     if (this.connectedDevices.get(deviceId) !== client) {
       return;
     }
+    this.removeCharChangeCallbacksForDevice(deviceId, client);
     this.connectedDevices.delete(deviceId);
     this.clearGattServicesReady(deviceId);
     this.unregisterMtuChangeCache(deviceId, client);
@@ -821,21 +955,48 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     this.gattServicesReady.set(deviceId, promise);
   }
 
+  private normalizeNegotiatedMtu(mtu: number, deviceId: string): number {
+    if (mtu >= ReactiveBleOhosPlugin.BLE_MTU_MIN) {
+      return mtu;
+    }
+    const actual = ReactiveBleOhosPlugin.BLE_ATT_DEFAULT_MTU;
+    this.logBleError(`MTU negotiation returned invalid value ${mtu} for ${deviceId}, using default ${actual}`,
+      new Error('invalid MTU'));
+    return actual;
+  }
+
+  private isActiveMtuNegotiation(deviceId: string, pending: MtuNegotiationPending): boolean {
+    if (pending.settled) {
+      return false;
+    }
+    const activeGeneration = this.mtuNegotiationGenerationByDevice.get(deviceId);
+    if (activeGeneration === undefined || pending.generation !== activeGeneration) {
+      return false;
+    }
+    return this.mtuNegotiationPendingByDevice.get(deviceId) === pending;
+  }
+
+  /**
+   * 设备可能协商出低于请求值的 MTU；若 MTU 大于当前请求的 clampedMtu，多为被取代的旧协商回调，应忽略。
+   */
+  private isMtuPlausibleForPendingRequest(mtu: number, pending: MtuNegotiationPending): boolean {
+    return mtu <= pending.clampedMtu;
+  }
+
   private onMtuChanged(deviceId: string, mtu: number): void {
     const pending = this.mtuNegotiationPendingByDevice.get(deviceId);
-    if (pending != null && !pending.settled) {
+    if (pending != null && this.isActiveMtuNegotiation(deviceId, pending)) {
+      if (!this.isMtuPlausibleForPendingRequest(mtu, pending)) {
+        this.logBleError(
+          `ignoring stale MTU ${mtu} for ${deviceId} (active request ${pending.clampedMtu})`,
+          new Error('stale MTU callback'));
+        return;
+      }
       pending.settled = true;
       if (pending.timeoutId >= 0) {
         clearTimeout(pending.timeoutId);
       }
-      let actual: number;
-      if (mtu >= ReactiveBleOhosPlugin.BLE_MTU_MIN) {
-        actual = mtu;
-      } else {
-        actual = ReactiveBleOhosPlugin.BLE_ATT_DEFAULT_MTU;
-        this.logBleError(`MTU negotiation returned invalid value ${mtu} for ${deviceId}, using default ${actual}`,
-          new Error('invalid MTU'));
-      }
+      const actual = this.normalizeNegotiatedMtu(mtu, deviceId);
       this.negotiatedMtuByDevice.set(deviceId, actual);
       pending.resolve(actual);
       this.mtuNegotiationPendingByDevice.delete(deviceId);
@@ -844,6 +1005,24 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     if (mtu >= ReactiveBleOhosPlugin.BLE_MTU_MIN) {
       this.negotiatedMtuByDevice.set(deviceId, mtu);
     }
+  }
+
+  private supersedeMtuNegotiation(deviceId: string): void {
+    const existing = this.mtuNegotiationPendingByDevice.get(deviceId);
+    if (existing != null && !existing.settled) {
+      existing.settled = true;
+      if (existing.timeoutId >= 0) {
+        clearTimeout(existing.timeoutId);
+      }
+      existing.reject(new Error('superseded by new MTU negotiation'));
+      this.mtuNegotiationPendingByDevice.delete(deviceId);
+    }
+  }
+
+  private allocateMtuNegotiationGeneration(deviceId: string): number {
+    const next = (this.mtuNegotiationGenerationByDevice.get(deviceId) ?? 0) + 1;
+    this.mtuNegotiationGenerationByDevice.set(deviceId, next);
+    return next;
   }
 
   private ensureMtuChangeHandler(deviceId: string, client: ble.GattClientDevice): void {
@@ -890,6 +1069,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     }
     this.mtuChangeHandlerByDevice.delete(deviceId);
     this.negotiatedMtuByDevice.delete(deviceId);
+    this.mtuNegotiationGenerationByDevice.delete(deviceId);
   }
 
   private negotiateMtuWithCallback(gatt: ble.GattClientDevice, deviceId: string,
@@ -897,42 +1077,37 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
     const clampedMtu = Math.max(ReactiveBleOhosPlugin.BLE_MTU_MIN,
       Math.min(ReactiveBleOhosPlugin.BLE_MTU_MAX, requestedMtu));
     this.ensureMtuChangeHandler(deviceId, gatt);
-    const existing = this.mtuNegotiationPendingByDevice.get(deviceId);
-    if (existing != null && !existing.settled) {
-      existing.settled = true;
-      if (existing.timeoutId >= 0) {
-        clearTimeout(existing.timeoutId);
-      }
-      existing.reject(new Error('superseded by new MTU negotiation'));
-      this.mtuNegotiationPendingByDevice.delete(deviceId);
-    }
+    this.supersedeMtuNegotiation(deviceId);
+    const generation = this.allocateMtuNegotiationGeneration(deviceId);
     return new Promise<number>((resolve: (mtu: number) => void, reject: (reason: Error) => void) => {
       const pending: MtuNegotiationPending = {
         settled: false,
         clampedMtu,
+        generation,
         resolve,
         reject,
         timeoutId: -1,
       };
+      this.mtuNegotiationPendingByDevice.set(deviceId, pending);
       pending.timeoutId = setTimeout(() => {
-        if (pending.settled) {
+        if (!this.isActiveMtuNegotiation(deviceId, pending)) {
           return;
         }
         pending.settled = true;
         this.mtuNegotiationPendingByDevice.delete(deviceId);
-        const fallback = this.negotiatedMtuByDevice.get(deviceId) ?? ReactiveBleOhosPlugin.BLE_ATT_DEFAULT_MTU;
-        reject(new Error(`MTU negotiation timeout, last known MTU: ${fallback}`));
+        reject(new Error('MTU negotiation timeout'));
       }, ReactiveBleOhosPlugin.MTU_NEGOTIATE_TIMEOUT_MS) as number;
-      this.mtuNegotiationPendingByDevice.set(deviceId, pending);
       try {
         gatt.setBLEMtuSize(clampedMtu);
       } catch (e) {
-        pending.settled = true;
-        if (pending.timeoutId >= 0) {
-          clearTimeout(pending.timeoutId);
+        if (this.isActiveMtuNegotiation(deviceId, pending)) {
+          pending.settled = true;
+          if (pending.timeoutId >= 0) {
+            clearTimeout(pending.timeoutId);
+          }
+          this.mtuNegotiationPendingByDevice.delete(deviceId);
+          reject(new Error(this.bleErrorMessage(e)));
         }
-        this.mtuNegotiationPendingByDevice.delete(deviceId);
-        reject(new Error((e as BusinessError).message ?? String(e)));
       }
     });
   }
@@ -1127,8 +1302,8 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
           break;
 
         case 'deinitialize':
-          this.stopScan();
-          this.disconnectAll();
+          this.disposeBleResources();
+          this.endAllEventSinks();
           result.success(null);
           break;
 
@@ -1214,6 +1389,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
                 if (isPendingSession) {
                   this.abortPendingConnect(deviceId, sessionId, client, msg);
                 } else if (this.connectedDevices.get(deviceId) === client) {
+                  this.removeCharChangeCallbacksForDevice(deviceId, client);
                   this.connectedDevices.delete(deviceId);
                   this.clearGattServicesReady(deviceId);
                   this.unregisterMtuChangeCache(deviceId, client);
@@ -1234,6 +1410,9 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
             if (timeoutInMs > 0) {
               const timeoutId = setTimeout(() => {
                 this.connectTimeoutId = -1;
+                if (!this.isActiveConnectSession(deviceId, sessionId)) {
+                  return;
+                }
                 if (this.connectedDevices.has(deviceId)) {
                   return;
                 }
@@ -1253,7 +1432,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
                 this.logBleError(`failed to close GattClient after connect error for ${deviceId}`, closeErr);
               }
             }
-            const msg = (e as BusinessError).message ?? String(e);
+            const msg = this.bleErrorMessage(e);
             this.emitConnectionUpdate(deviceId, CONN_STATE_DISCONNECTED, msg);
             this.connectingDeviceId = null;
             this.connectingClient = null;
@@ -1266,6 +1445,8 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
           const deviceId = args['deviceId'] as string | undefined ?? '';
           this.connectSessionByDevice.delete(deviceId);
           this.clearConnectTimeout();
+          this.clearMtuNegotiationPending(deviceId, 'device disconnected');
+          this.cancelNameRequestForDevice(deviceId);
           const gatt = this.connectedDevices.get(deviceId);
           this.removeCharChangeCallbacksForDevice(deviceId, gatt ?? undefined);
           this.clearGattServicesReady(deviceId);
@@ -1310,7 +1491,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
             const list = this.buildDiscoveredServicesList(deviceId, services);
             result.success(list);
           } catch (e) {
-            const msg = (e as BusinessError).message ?? String(e);
+            const msg = this.bleErrorMessage(e);
             result.error('discoverServices', msg, null);
           }
           break;
@@ -1352,7 +1533,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
             const value = this.characteristicValueToNumberArray(readChar.characteristicValue);
             this.emitCharValue(characteristic, value);
           } catch (e) {
-            this.emitCharValue(characteristic, undefined, (e as BusinessError).message ?? String(e));
+            this.emitCharValue(characteristic, undefined, this.bleErrorMessage(e));
           }
           result.success(null);
           break;
@@ -1401,7 +1582,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
             const successPayload: WriteResultPayload = { characteristic };
             result.success(successPayload);
           } catch (e) {
-            const errPayload: WriteResultPayload = { characteristic, error: (e as BusinessError).message ?? String(e) };
+            const errPayload: WriteResultPayload = { characteristic, error: this.bleErrorMessage(e) };
             result.success(errPayload);
           }
           break;
@@ -1480,12 +1661,12 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
               if (newCallbackRegistered) {
                 this.unregisterCharChangeCallback(deviceId, serviceId, characteristicId, gatt);
               }
-              const errorMsg = (e as BusinessError).message ?? String(e);
+              const errorMsg = this.bleErrorMessage(e);
               this.emitCharValue(characteristic, undefined, `Failed to subscribe: ${errorMsg}`);
               this.logBleError(`readNotifications failed for ${deviceId}`, e);
             }
           } catch (e) {
-            const errorMsg = (e as BusinessError).message ?? String(e);
+            const errorMsg = this.bleErrorMessage(e);
             this.emitCharValue(characteristic, undefined, `Failed to subscribe: ${errorMsg}`);
             this.logBleError(`readNotifications failed for ${deviceId}`, e);
           }
@@ -1528,7 +1709,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
             const mtuPayload: MtuResultPayload = { mtu: actualMtu };
             result.success(mtuPayload);
           }).catch((e: object) => {
-            result.error('negotiateMtuSize', (e as BusinessError).message ?? String(e), null);
+            result.error('negotiateMtuSize', this.bleErrorMessage(e), null);
           });
           break;
         }
@@ -1553,7 +1734,7 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
             const rssiPayload: RssiResultPayload = { rssi };
             result.success(rssiPayload);
           } catch (e) {
-            result.error('readRssi', (e as BusinessError).message ?? String(e), null);
+            result.error('readRssi', this.bleErrorMessage(e), null);
           }
           break;
         }
@@ -1562,7 +1743,8 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
           result.notImplemented();
       }
     } catch (e) {
-      result.error('ReactiveBleOhos', String(e), null);
+      this.logBleError(`unhandled method ${method}`, e);
+      result.error(method, this.bleErrorMessage(e), null);
     }
   }
 
@@ -1661,21 +1843,24 @@ export default class ReactiveBleOhosPlugin implements FlutterPlugin, MethodCallH
   }
 
   private removeCharChangeCallbacksForDevice(deviceId: string, gatt?: ble.GattClientDevice): void {
+    const prefix = `${deviceId}|`;
     const keysToRemove: string[] = [];
-    this.charChangeCallbacks.forEach((callback, key) => {
-      if (key.startsWith(`${deviceId}|`)) {
+    this.charChangeCallbacks.forEach((_callback: (ch: ble.BLECharacteristic) => void, key: string) => {
+      if (key.startsWith(prefix)) {
         keysToRemove.push(key);
-        if (gatt != null) {
-          try {
-            gatt.off('BLECharacteristicChange', callback);
-          } catch (e) {
-            this.logBleError(`failed to unregister characteristic change callback for ${deviceId}`, e);
-          }
-        }
       }
     });
     for (let i = 0; i < keysToRemove.length; i++) {
-      this.charChangeCallbacks.delete(keysToRemove[i]);
+      const key = keysToRemove[i];
+      const callback = this.charChangeCallbacks.get(key);
+      if (callback != null && gatt != null) {
+        try {
+          gatt.off('BLECharacteristicChange', callback);
+        } catch (e) {
+          this.logBleError(`failed to unregister characteristic change callback for ${key}`, e);
+        }
+      }
+      this.charChangeCallbacks.delete(key);
     }
   }
 
